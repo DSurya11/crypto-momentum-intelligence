@@ -17,6 +17,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import joblib
 import numpy as np
 import psycopg
 from dotenv import load_dotenv
@@ -158,7 +159,9 @@ def score_live(
     robust: bool,
     feature_names: list[str],
     sample_weights: np.ndarray | None = None,
+    model_save_path: str | None = None,
 ):
+    _bundle: dict = {}
     if robust:
         x_train_pp, x_score_pp, _ = robust_preprocess(x_train, x_score, feature_names=feature_names)
     else:
@@ -183,6 +186,7 @@ def score_live(
         coefs = np.abs(lr.named_steps["clf"].coef_[0]) if hasattr(lr, "named_steps") else np.abs(lr.coef_[0])
         total = coefs.sum() or 1.0
         importances = {fn: round(float(c / total * 100), 2) for fn, c in zip(feature_names, coefs)}
+        _bundle = {"model": lr}
 
     elif model_type == "xgboost_tuned":
         tuned_params = tune_xgboost(x_train_pp, y_train, top_frac=0.10)
@@ -192,6 +196,7 @@ def score_live(
         raw = xgb.feature_importances_
         total = raw.sum() or 1.0
         importances = {fn: round(float(v / total * 100), 2) for fn, v in zip(feature_names, raw)}
+        _bundle = {"model": xgb}
 
     elif model_type == "ensemble":
         lr = make_logistic()
@@ -212,6 +217,7 @@ def score_live(
         xgb_total = xgb_raw.sum() or 1.0
         blended = 0.4 * (lr_coefs / lr_total) + 0.6 * (xgb_raw / xgb_total)
         importances = {fn: round(float(v * 100), 2) for fn, v in zip(feature_names, blended)}
+        _bundle = {"lr": lr, "xgb": xgb}
 
     elif model_type == "stacking":
         # ── Level-0: time-aware OOF predictions from 4 diverse base learners ──
@@ -244,6 +250,7 @@ def score_live(
             xgb_r = xgb_fb.feature_importances_
             blended = 0.4 * (lr_c / (lr_c.sum() or 1)) + 0.6 * (xgb_r / (xgb_r.sum() or 1))
             importances = {fn: round(float(v * 100), 2) for fn, v in zip(feature_names, blended)}
+            _bundle = {"lr": lr_fb, "xgb": xgb_fb}
         else:
             if meta_sw is not None:
                 meta.fit(meta_x, meta_y, sample_weight=meta_sw)
@@ -300,9 +307,16 @@ def score_live(
                 + meta_w[3] * _norm(et_raw)
             )
             importances = {fn: round(float(v * 100), 2) for fn, v in zip(feature_names, blended)}
+            _bundle = {"lr": lr_f, "xgb": xgb_f, "rf": rf_f, "et": et_f, "meta": meta}
 
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
+
+    if model_save_path and _bundle:
+        os.makedirs(os.path.dirname(model_save_path) or ".", exist_ok=True)
+        _bundle.update({"model_type": model_type, "feature_names": feature_names, "importances": importances})
+        joblib.dump(_bundle, model_save_path)
+        print(f"[MODEL] Saved \u2192 {model_save_path}")
 
     return prob, tuned_params, importances
 
@@ -501,6 +515,7 @@ def main() -> None:
     parser.add_argument("--top-n", type=int, default=50)
     parser.add_argument("--market-api", choices=["none", "coinstats"], default="coinstats")
     parser.add_argument("--snapshot-path", default="research/live_picks_snapshot.csv")
+    parser.add_argument("--model-path", default="research/model.pkl", help="Path to save the trained model bundle (joblib)")
     parser.add_argument("--verify-minutes", type=int, default=5)
     args = parser.parse_args()
 
@@ -547,6 +562,7 @@ def main() -> None:
             robust=(args.preprocessing == "robust"),
             feature_names=feature_names,
             sample_weights=sample_weights,
+            model_save_path=args.model_path,
         )
 
         ranked_idx = np.argsort(probs)[::-1]
