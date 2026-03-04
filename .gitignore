@@ -1,0 +1,36 @@
+# Environment — contains DB password and API keys, NEVER commit
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Runtime artifacts — generated each tick
+pipeline.log
+pipeline_err.log
+research/live_picks_snapshot.csv
+research/feature_importance.json
+research/walkforward_runs.csv
+research/walkforward_drift_monitor.lock
+research/*.pkl
+research/*.joblib
+
+# Frontend build output and dependencies
+frontend/alpha-whisperer-pro/node_modules/
+frontend/alpha-whisperer-pro/dist/
+frontend/alpha-whisperer-pro/.vite/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
