@@ -7,7 +7,7 @@ import subprocess
 import threading
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT_PATH = PROJECT_ROOT / "research" / "live_picks_snapshot.csv"
+THRESHOLDS_PATH = PROJECT_ROOT / "research" / "score_thresholds.json"
 
 app = FastAPI(title="Crypto Momentum Backend")
 app.add_middleware(
@@ -36,6 +37,7 @@ class RunCycleRequest(BaseModel):
     tickCount: int = 1
     topN: int = 10
     marketApi: str = "coinstats"
+    ingestMaxPools: int = 15
 
 
 # ---- Background cycle runner state ----------------------------------------
@@ -67,6 +69,8 @@ def _run_cycle_background(req: RunCycleRequest) -> None:
         str(req.topN),
         "-MarketApi",
         req.marketApi,
+        "-IngestMaxPools",
+        str(req.ingestMaxPools),
     ]
 
     with _cycle_lock:
@@ -141,42 +145,52 @@ def _conn() -> psycopg.Connection:
     )
 
 
-def _recommendations_from_scores(score_pcts: list[float]) -> list[str]:
-    """Assign recommendations by percentile rank within the batch.
+_DEFAULT_THRESHOLDS = {"strong_buy": 35.0, "buy": 27.0, "neutral": 20.0}
 
-    Model-agnostic: works regardless of score scale (ensemble probabilities
-    cluster 35-60%, stacking meta-learner probabilities cluster 15-28%, etc.).
 
-    Within the batch:
-      Top  20% of scores → "strong_buy"
-      Next 20%           → "buy"
-      Next 20%           → "neutral"
-      Bottom 40%         → "sell"
+def _load_thresholds() -> dict:
+    """Load calibrated score thresholds from research/score_thresholds.json.
 
-    This guarantees a sensible label distribution regardless of which model
-    produced the scores or what probability scale it uses.
+    Values in the JSON are stored as 0-1 floats (feedback_loop scale).
+    This function returns them multiplied by 100 to match score_pcts scale
+    used throughout api.py.  Falls back to hardcoded defaults.
     """
-    if not score_pcts:
-        return []
-    n = len(score_pcts)
-    if n == 1:
-        return ["neutral"]
+    try:
+        with open(THRESHOLDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if all(k in data for k in ("strong_buy", "buy", "neutral")):
+            return {
+                "strong_buy": float(data["strong_buy"]) * 100.0,
+                "buy":        float(data["buy"])        * 100.0,
+                "neutral":    float(data["neutral"])    * 100.0,
+            }
+    except Exception:
+        pass
+    return dict(_DEFAULT_THRESHOLDS)
 
-    # Rank: 0 = highest score, n-1 = lowest
-    import numpy as _np
-    arr = _np.array(score_pcts)
-    # fractional rank relative to batch (0.0 = top, 1.0 = bottom)
-    order = arr.argsort()[::-1]  # indices sorted best→worst
-    rank_pct = _np.empty(n)
-    rank_pct[order] = _np.linspace(0.0, 1.0, n)
+
+def _recommendations_from_scores(score_pcts: list[float]) -> list[str]:
+    """Assign recommendations purely from absolute model score (score_pcts 0–100).
+
+    Thresholds are loaded from research/score_thresholds.json, auto-calibrated
+    each cycle by compute_adaptive_thresholds() in feedback_loop.py based on
+    real win rates per score bucket.  Falls back to hardcoded defaults.
+
+    In a weak session where all scores are low there may be zero strong_buy
+    picks — that is the correct honest behaviour.
+    """
+    t = _load_thresholds()
+    STRONG_BUY = t["strong_buy"]
+    BUY        = t["buy"]
+    NEUTRAL    = t["neutral"]
 
     result: list[str] = []
-    for rp in rank_pct:
-        if rp < 0.20:
+    for score in score_pcts:
+        if score >= STRONG_BUY:
             result.append("strong_buy")
-        elif rp < 0.40:
+        elif score >= BUY:
             result.append("buy")
-        elif rp < 0.60:
+        elif score >= NEUTRAL:
             result.append("neutral")
         else:
             result.append("sell")
@@ -184,16 +198,13 @@ def _recommendations_from_scores(score_pcts: list[float]) -> list[str]:
 
 
 def _score_to_recommendation(score_pct: float) -> str:
-    """Legacy single-score thresholds — ONLY used as fallback for single-item queries.
-
-    For any batch context use _recommendations_from_scores() instead, which is
-    rank-based and model-agnostic.
-    """
-    if score_pct >= 55:
+    """Single-score recommendation using same adaptive thresholds."""
+    t = _load_thresholds()
+    if score_pct >= t["strong_buy"]:
         return "strong_buy"
-    if score_pct >= 45:
+    if score_pct >= t["buy"]:
         return "buy"
-    if score_pct >= 35:
+    if score_pct >= t["neutral"]:
         return "neutral"
     return "sell"
 
@@ -223,15 +234,15 @@ def _normalize_snapshot_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _read_latest_snapshot(top_n: int | None = None) -> tuple[str, list[dict[str, str]]]:
+def _read_latest_snapshot(top_n: int | None = None) -> tuple[str | None, list[dict[str, str]]]:
     if not SNAPSHOT_PATH.exists():
-        raise FileNotFoundError("live_picks_snapshot.csv not found")
+        return None, []
 
     with SNAPSHOT_PATH.open("r", encoding="utf-8", newline="") as f:
         rows = [_normalize_snapshot_row(r) for r in csv.DictReader(f)]
 
     if not rows:
-        raise ValueError("live_picks_snapshot.csv is empty")
+        return None, []
 
     # Latest timestamp *per chain* so every chain stays represented even when
     # each chain is processed at a slightly different moment during a cycle.
@@ -343,6 +354,25 @@ def api_health():
                 cur.execute("SELECT MAX(bucket_timestamp) FROM features_5m")
                 max_feature_bucket = cur.fetchone()[0]
 
+                # Win rate from pick_outcomes: correct direction = win
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE
+                            WHEN recommendation = 'sell'     AND effective_return <= 0 THEN 1
+                            WHEN recommendation != 'sell'    AND effective_return >  0 THEN 1
+                            ELSE 0
+                        END) AS wins
+                    FROM pick_outcomes
+                    """
+                )
+                _wr = cur.fetchone()
+                win_rate: float | None = (
+                    round(float(_wr[1]) / float(_wr[0]) * 100.0, 1)
+                    if _wr and _wr[0] else None
+                )
+
         # lastRun = most recent of: snapshot pick time or latest pipeline bucket
         try:
             picked_at, picks = _read_latest_snapshot(top_n=1)
@@ -390,7 +420,7 @@ def api_health():
             "pipeline": "online",
             "lastRun": last_run,
             "totalPicks": total_picks,
-            "winRate": None,
+            "winRate": win_rate,
             "swaps": swaps,
             "labels": labels,
             "latestBucket": max_feature_bucket.isoformat() if max_feature_bucket else None,
@@ -413,6 +443,8 @@ def api_health():
 @app.get("/api/latest-picks")
 def api_latest_picks(top_n: int = 10, chain: str = "all"):
     picked_at, all_picks = _read_latest_snapshot(top_n=None)
+    if picked_at is None:
+        return {"pickedAt": None, "elapsedMinutes": None, "rows": []}
     chain_raw = (chain or "all").strip().lower()
     if chain_raw != "all":
         allowed = {c.strip() for c in chain_raw.split(",") if c.strip()}
@@ -483,6 +515,8 @@ def api_latest_picks(top_n: int = 10, chain: str = "all"):
 @app.get("/api/verify-latest")
 def api_verify_latest():
     picked_at, picks = _read_latest_snapshot(top_n=None)
+    if picked_at is None:
+        return {"message": "No picks yet", "verified": []}
     now = datetime.now(timezone.utc)
     elapsed_min = (now - datetime.fromisoformat(picked_at)).total_seconds() / 60.0
 
@@ -521,214 +555,368 @@ def api_verify_latest():
 
 @app.get("/api/performance")
 def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell", verified_only: bool = True):
-    if not SNAPSHOT_PATH.exists():
-        return {"rows": [], "cumulative": [], "summary": {"winRate": 0, "avgReturn2h": 0, "total": 0}}
-
-    with SNAPSHOT_PATH.open("r", encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
-
-    rows = sorted(rows, key=lambda r: r["picked_at_utc"], reverse=True)
-
-    # Pre-compute rank-based recommendations grouped by cycle (picked_at_utc).
-    # This is model-agnostic: top 20% → strong_buy, next 20% → buy, etc.,
-    # regardless of whether scores cluster at 15-30% (stacking) or 35-60% (ensemble).
-    from collections import defaultdict as _dd
-    _cycle_rows: dict[str, list[dict]] = _dd(list)
-    for r in rows:
-        _cycle_rows[r["picked_at_utc"]].append(r)
-
-    _rec_cache: dict[tuple[str, str], str] = {}  # (token_address, picked_at_utc) → label
-    for cycle_ts, cycle_picks in _cycle_rows.items():
-        _spcts = [
-            (_safe_float(p.get("score")) or 0.0) * 100.0
-            if (_safe_float(p.get("score")) or 0.0) <= 1.0
-            else (_safe_float(p.get("score")) or 0.0)
-            for p in cycle_picks
-        ]
-        _recs = _recommendations_from_scores(_spcts)
-        for p, label in zip(cycle_picks, _recs):
-            _rec_cache[(p["token_address"], cycle_ts)] = label
-
+    """
+    Performance endpoint backed by pick_outcomes table (all verified history)
+    plus the live snapshot CSV for picks still too recent to be verified.
+    """
+    _OUTLIER_CAP = 500.0
+    LONG_LABELS = {"buy", "strong_buy"}
     allowed_labels = {x.strip() for x in labels.split(",") if x.strip()}
-    perf_rows = []
-    seen_selected_tokens: set[str] = set()
-    for r in rows:
-        token = r["token_address"]
-        if token in seen_selected_tokens:
-            continue
+    t = _load_thresholds()  # current score thresholds (0-100 scale)
+    _sb, _buy, _neu = t["strong_buy"], t["buy"], t["neutral"]
+    # SQL expression that normalises model_score to 0-100 regardless of storage scale
+    _score_pct_sql = "(CASE WHEN model_score <= 1.0 THEN model_score * 100.0 ELSE model_score END)"
+    # SQL CASE that converts normalised score to label using current thresholds
+    _rec_sql = (
+        f"CASE WHEN {_score_pct_sql} >= {_sb}  THEN 'strong_buy'"
+        f"     WHEN {_score_pct_sql} >= {_buy} THEN 'buy'"
+        f"     WHEN {_score_pct_sql} >= {_neu} THEN 'neutral'"
+        f"     ELSE 'sell' END"
+    )
 
-        picked_bucket = datetime.fromisoformat(r["bucket_timestamp"])
-        picked_price = _safe_float(r.get("entry_close_price"))
-        score_raw = _safe_float(r.get("score"))
-        score_pct = (score_raw * 100.0) if (score_raw is not None and score_raw <= 1.0) else (score_raw or 0.0)
-        recommendation = _rec_cache.get((token, r["picked_at_utc"]), _score_to_recommendation(score_pct))
+    def _is_model_win(rec: str, eff_ret: float) -> bool:
+        """Sell = win if price fell; all others = win if price rose."""
+        return eff_ret <= 0 if rec == "sell" else eff_ret > 0
 
-        if allowed_labels and recommendation not in allowed_labels:
-            continue
+    def _capped(v: float) -> float:
+        return min(max(v, -_OUTLIER_CAP), _OUTLIER_CAP)
 
-        if not picked_price or picked_price == 0:
-            continue
-
-        p5 = p10 = p2h = None
-        future_points = 0
-        r5 = r10 = r2h = None
-        try:
-            with _conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT
-                            (
-                                SELECT close_price::DOUBLE PRECISION
-                                FROM token_price_5m
-                                WHERE token_address = %s
-                                  AND bucket_timestamp >= (%s::timestamptz + INTERVAL '5 minutes')
-                                ORDER BY bucket_timestamp ASC
-                                LIMIT 1
-                            ) AS price_5m,
-                            (
-                                SELECT close_price::DOUBLE PRECISION
-                                FROM token_price_5m
-                                WHERE token_address = %s
-                                  AND bucket_timestamp >= (%s::timestamptz + INTERVAL '10 minutes')
-                                ORDER BY bucket_timestamp ASC
-                                LIMIT 1
-                            ) AS price_10m,
-                            (
-                                SELECT close_price::DOUBLE PRECISION
-                                FROM token_price_5m
-                                WHERE token_address = %s
-                                  AND bucket_timestamp >= (%s::timestamptz + INTERVAL '2 hours')
-                                ORDER BY bucket_timestamp ASC
-                                LIMIT 1
-                            ) AS price_2h,
-                            (
-                                SELECT COUNT(*)::INT
-                                FROM token_price_5m
-                                WHERE token_address = %s
-                                  AND bucket_timestamp > %s::timestamptz
-                                  AND bucket_timestamp <= (%s::timestamptz + INTERVAL '2 hours')
-                            ) AS points_until_2h
-                        """,
+    # ── 1. Pull verified picks from pick_outcomes ──────────────────────────
+    verified_rows: list[dict] = []
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                # Most-recent pick per token from pick_outcomes, labelled correctly
+                cur.execute(
+                    """
+                    SELECT
+                        po.token_address,
+                        COALESCE(t.symbol, po.token_address) AS symbol,
+                        COALESCE(t.name, po.token_address)   AS name,
+                        po.chain,
+                        po.picked_at_utc,
+                        po.bucket_timestamp,
+                        po.model_score,
+                        po.recommendation,
+                        po.entry_price,
+                        po.price_2h,
+                        po.effective_return,
+                        po.is_win,
                         (
-                            token,
-                            picked_bucket,
-                            token,
-                            picked_bucket,
-                            token,
-                            picked_bucket,
-                            token,
-                            picked_bucket,
-                            picked_bucket,
-                        ),
-                    )
-                    rec = cur.fetchone()
+                            SELECT close_price::DOUBLE PRECISION
+                            FROM token_price_5m
+                            WHERE token_address = po.token_address
+                              AND bucket_timestamp >= po.bucket_timestamp + INTERVAL '5 minutes'
+                            ORDER BY bucket_timestamp ASC
+                            LIMIT 1
+                        ) AS price_5m,
+                        (
+                            SELECT close_price::DOUBLE PRECISION
+                            FROM token_price_5m
+                            WHERE token_address = po.token_address
+                              AND bucket_timestamp >= po.bucket_timestamp + INTERVAL '10 minutes'
+                            ORDER BY bucket_timestamp ASC
+                            LIMIT 1
+                        ) AS price_10m
+                    FROM (
+                        SELECT DISTINCT ON (token_address)
+                            token_address, chain, picked_at_utc, bucket_timestamp,
+                            model_score, recommendation, entry_price, price_2h,
+                            effective_return, is_win
+                        FROM pick_outcomes
+                        ORDER BY token_address, picked_at_utc DESC
+                    ) po
+                    LEFT JOIN tokens t ON t.token_address = po.token_address
+                    ORDER BY po.picked_at_utc DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                db_rows = cur.fetchall()
 
-            if rec:
-                p5 = float(rec[0]) if rec[0] is not None else None
-                p10 = float(rec[1]) if rec[1] is not None else None
-                p2h = float(rec[2]) if rec[2] is not None else None
-                future_points = int(rec[3] or 0)
+            for r in db_rows:
+                (
+                    token_address, symbol, name, chain,
+                    picked_at_utc, bucket_ts,
+                    model_score, recommendation,
+                    entry_price, price_2h, eff_ret, is_win_db,
+                    price_5m, price_10m,
+                ) = r
 
-            if p5 is not None:
-                r5 = ((p5 - picked_price) / picked_price) * 100.0
-            if p10 is not None:
-                r10 = ((p10 - picked_price) / picked_price) * 100.0
-            if p2h is not None:
-                r2h = ((p2h - picked_price) / picked_price) * 100.0
-        except Exception:
-            pass
+                score_pct = (float(model_score) * 100.0) if (model_score is not None and float(model_score) <= 1.0) else (float(model_score or 0))
+                # Always re-derive label from current thresholds (stored value may be from old rank-based system)
+                # Use pre-loaded _sb/_buy/_neu to avoid re-reading JSON per row
+                recommendation = ("strong_buy" if score_pct >= _sb else "buy" if score_pct >= _buy else "neutral" if score_pct >= _neu else "sell")
 
-        # All picks tracked as long positions — no sell inversion
-        er5, er10, er2h = r5, r10, r2h
+                if allowed_labels and recommendation not in allowed_labels:
+                    continue
 
-        if verified_only and p2h is None:
-            continue
+                ep = float(entry_price) if entry_price is not None else None
+                p2h = float(price_2h) if price_2h is not None else None
+                er2h_raw = float(eff_ret) if eff_ret is not None else None
+                p5 = float(price_5m) if price_5m is not None else None
+                p10 = float(price_10m) if price_10m is not None else None
+                r5_raw = ((p5 - ep) / ep * 100.0) if (p5 and ep) else None
+                r10_raw = ((p10 - ep) / ep * 100.0) if (p10 and ep) else None
 
-        seen_selected_tokens.add(token)
+                # Cap displayed per-row returns at ±500%; flag real outliers
+                is_outlier = (er2h_raw is not None and abs(er2h_raw) > _OUTLIER_CAP)
+                er2h = _capped(er2h_raw) if er2h_raw is not None else None
+                r5   = _capped(r5_raw)   if r5_raw   is not None else None
+                r10  = _capped(r10_raw)  if r10_raw  is not None else None
 
-        perf_rows.append(
-            {
+                picked_at_str = picked_at_utc.isoformat() if hasattr(picked_at_utc, "isoformat") else str(picked_at_utc)
+
+                verified_rows.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "chain": chain or "base",
+                    "pickedAt": picked_at_str,
+                    "recommendation": recommendation,
+                    "scorePct": score_pct,
+                    "pickedPrice": ep,
+                    "price5m": p5,
+                    "price10m": p10,
+                    "price2h": p2h,
+                    "futurePoints": 24,  # historical; actual bar count not critical
+                    "return5m": r5,
+                    "return10m": r10,
+                    "return2h": er2h,
+                    "effectiveReturn5m": r5,
+                    "effectiveReturn10m": r10,
+                    "effectiveReturn2h": er2h,
+                    "isOutlier": is_outlier,
+                    "verified": True,
+                })
+
+    except Exception as exc:
+        # DB unavailable — fall through to CSV-only mode
+        import traceback; traceback.print_exc()
+
+    # ── 2. Recent unverified picks from CSV (< 2.5h old) ─────────────────
+    recent_csv_rows: list[dict] = []
+    if SNAPSHOT_PATH.exists():
+        cutoff_ts = datetime.now(timezone.utc) - timedelta(hours=2.5)
+        with SNAPSHOT_PATH.open("r", encoding="utf-8", newline="") as f:
+            csv_picks = list(csv.DictReader(f))
+
+        from collections import defaultdict as _dd
+        _cycle_rows: dict[str, list[dict]] = _dd(list)
+        for r in csv_picks:
+            _cycle_rows[r.get("picked_at_utc", "")].append(r)
+        _rec_cache: dict[tuple[str, str], str] = {}
+        for cycle_ts, cycle_picks in _cycle_rows.items():
+            _spcts = [
+                (_safe_float(p.get("score")) or 0.0) * 100.0
+                if (_safe_float(p.get("score")) or 0.0) <= 1.0
+                else (_safe_float(p.get("score")) or 0.0)
+                for p in cycle_picks
+            ]
+            _recs = _recommendations_from_scores(_spcts)
+            for p, label in zip(cycle_picks, _recs):
+                _rec_cache[(p["token_address"], cycle_ts)] = label
+
+        seen_csv: set[str] = set()
+        for r in sorted(csv_picks, key=lambda x: x.get("picked_at_utc", ""), reverse=True):
+            token = r.get("token_address", "")
+            if not token or token in seen_csv:
+                continue
+            try:
+                picked_at = datetime.fromisoformat(r["picked_at_utc"])
+                if picked_at.tzinfo is None:
+                    picked_at = picked_at.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            # Only include picks too recent to be in pick_outcomes
+            if picked_at <= cutoff_ts:
+                continue
+
+            score_raw = _safe_float(r.get("score"))
+            score_pct = (score_raw * 100.0) if (score_raw is not None and score_raw <= 1.0) else (score_raw or 0.0)
+            recommendation = _rec_cache.get((token, r.get("picked_at_utc", "")), _score_to_recommendation(score_pct))
+
+            if allowed_labels and recommendation not in allowed_labels:
+                continue
+
+            ep = _safe_float(r.get("entry_close_price"))
+            if not ep or ep == 0:
+                continue
+
+            picked_bucket = datetime.fromisoformat(r["bucket_timestamp"])
+            p5 = p10 = p2h = None
+            r5 = r10 = r2h = None
+            try:
+                with _conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT
+                                (SELECT close_price::DOUBLE PRECISION FROM token_price_5m
+                                  WHERE token_address = %s AND bucket_timestamp >= (%s::timestamptz + INTERVAL '5 minutes')
+                                  ORDER BY bucket_timestamp ASC LIMIT 1),
+                                (SELECT close_price::DOUBLE PRECISION FROM token_price_5m
+                                  WHERE token_address = %s AND bucket_timestamp >= (%s::timestamptz + INTERVAL '10 minutes')
+                                  ORDER BY bucket_timestamp ASC LIMIT 1),
+                                (SELECT close_price::DOUBLE PRECISION FROM token_price_5m
+                                  WHERE token_address = %s AND bucket_timestamp >= (%s::timestamptz + INTERVAL '2 hours')
+                                  ORDER BY bucket_timestamp ASC LIMIT 1)
+                            """,
+                            (token, picked_bucket, token, picked_bucket, token, picked_bucket),
+                        )
+                        rec = cur.fetchone()
+                if rec:
+                    p5 = float(rec[0]) if rec[0] is not None else None
+                    p10 = float(rec[1]) if rec[1] is not None else None
+                    p2h = float(rec[2]) if rec[2] is not None else None
+                    if p5: r5 = (p5 - ep) / ep * 100.0
+                    if p10: r10 = (p10 - ep) / ep * 100.0
+                    if p2h: r2h = (p2h - ep) / ep * 100.0
+            except Exception:
+                pass
+
+            if verified_only and p2h is None:
+                continue
+
+            seen_csv.add(token)
+            recent_csv_rows.append({
                 "symbol": r.get("symbol"),
                 "name": r.get("name"),
                 "chain": r.get("chain", "base"),
                 "pickedAt": r.get("picked_at_utc"),
                 "recommendation": recommendation,
                 "scorePct": score_pct,
-                "pickedPrice": picked_price,
-                "price5m": p5,
-                "price10m": p10,
-                "price2h": p2h,
-                "futurePoints": future_points,
-                "return5m": r5,
-                "return10m": r10,
-                "return2h": r2h,
-                "effectiveReturn5m": er5,
-                "effectiveReturn10m": er10,
-                "effectiveReturn2h": er2h,
+                "pickedPrice": ep,
+                "price5m": p5, "price10m": p10, "price2h": p2h,
+                "futurePoints": 0,
+                "return5m": _capped(r5) if r5 is not None else None,
+                "return10m": _capped(r10) if r10 is not None else None,
+                "return2h": _capped(r2h) if r2h is not None else None,
+                "effectiveReturn5m": _capped(r5) if r5 is not None else None,
+                "effectiveReturn10m": _capped(r10) if r10 is not None else None,
+                "effectiveReturn2h": _capped(r2h) if r2h is not None else None,
+                "isOutlier": (r2h is not None and abs(r2h) > _OUTLIER_CAP),
                 "verified": r2h is not None,
-            }
-        )
+            })
 
-        if len(perf_rows) >= max(1, limit):
-            break
+    # ── 3. Merge: CSV recent on top, then verified DB rows ─────────────────
+    # Deduplicate: CSV takes precedence for tokens appearing in both
+    csv_tokens = {r["symbol"] for r in recent_csv_rows}
+    perf_rows = recent_csv_rows + [r for r in verified_rows if r["symbol"] not in csv_tokens]
+    perf_rows = perf_rows[:limit]
 
-    valid_2h = [p for p in perf_rows if p["effectiveReturn2h"] is not None]
-    total = len(valid_2h)
+    # ── 4. Aggregate stats from the FULL pick_outcomes table (not just limit) ──
+    total = 0
+    win_rate = 0.0
+    avg_ret = 0.0
+    chain_breakdown: dict = {}
+    rec_breakdown: dict = {}
+    cumulative: list = []
 
-    def _is_model_win(p: dict) -> bool:
-        """Model win = directional call was correct.
-        Sell = model predicted no gain → win if price fell (ret ≤ 0).
-        All other labels = model predicted gain → win if price rose (ret > 0)."""
-        ret = p["effectiveReturn2h"]
-        return ret <= 0 if p["recommendation"] == "sell" else ret > 0
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                # Overall (re-derive recommendation from model_score using current thresholds)
+                cur.execute(
+                    f"""
+                    SELECT
+                        COUNT(*),
+                        SUM(CASE WHEN ({_rec_sql} = 'sell' AND effective_return <= 0)
+                                   OR ({_rec_sql} != 'sell' AND effective_return > 0)
+                                 THEN 1 ELSE 0 END),
+                        AVG(LEAST(GREATEST(effective_return, %s), %s))
+                            FILTER (WHERE {_rec_sql} IN ('buy','strong_buy'))
+                    FROM pick_outcomes
+                    """,
+                    (-_OUTLIER_CAP, _OUTLIER_CAP),
+                )
+                row = cur.fetchone()
+                total = int(row[0] or 0)
+                wins_all = int(row[1] or 0)
+                avg_ret = float(row[2] or 0.0) if row[2] is not None else 0.0
+                win_rate = (wins_all / total * 100.0) if total else 0.0
 
-    win_rate = (sum(1 for p in valid_2h if _is_model_win(p)) / total * 100.0) if total else 0.0
+                # Chain breakdown (re-derive recommendation from model_score using current thresholds)
+                cur.execute(
+                    f"""
+                    SELECT
+                        chain,
+                        COUNT(*) AS n,
+                        SUM(CASE WHEN ({_rec_sql} = 'sell' AND effective_return<=0)
+                                   OR ({_rec_sql} != 'sell' AND effective_return>0)
+                                 THEN 1 ELSE 0 END) AS wins,
+                        AVG(LEAST(GREATEST(effective_return, %s), %s))
+                            FILTER (WHERE {_rec_sql} IN ('buy','strong_buy')) AS avg_ret,
+                        MAX(effective_return) FILTER (WHERE {_rec_sql} IN ('buy','strong_buy')) AS best,
+                        MIN(effective_return) FILTER (WHERE {_rec_sql} IN ('buy','strong_buy')) AS worst
+                    FROM pick_outcomes
+                    GROUP BY chain ORDER BY n DESC
+                    """,
+                    (-_OUTLIER_CAP, _OUTLIER_CAP),
+                )
+                for r in cur.fetchall():
+                    n = int(r[1] or 0)
+                    w = int(r[2] or 0)
+                    chain_breakdown[r[0]] = {
+                        "total": n,
+                        "wins": w,
+                        "winRate": (w / n * 100.0) if n else 0.0,
+                        "avgReturn": float(r[3] or 0.0),
+                        "bestReturn": float(r[4] or 0.0),
+                        "worstReturn": float(r[5] or 0.0),
+                        "outliers": 0,
+                    }
 
-    # Cumulative return = only picks you'd actually enter (buy / strong_buy).
-    # Sell picks are avoidance signals — no position is opened, so they don't
-    # contribute to portfolio return.  Neutral is also excluded (no clear entry).
-    LONG_LABELS = {"buy", "strong_buy"}
-    traded = [p for p in valid_2h if p["recommendation"] in LONG_LABELS]
-    # Cap extreme returns at ±500% for avg to prevent data anomalies (e.g. 10x pumps) from dominating
-    _OUTLIER_CAP = 500.0
-    avg_ret = (sum(min(max(p["effectiveReturn2h"], -_OUTLIER_CAP), _OUTLIER_CAP) for p in traded) / len(traded)) if traded else 0.0
+                # Recommendation breakdown (group by score-derived label, not stored label)
+                cur.execute(
+                    f"""
+                    SELECT
+                        {_rec_sql} AS rec,
+                        COUNT(*) AS n,
+                        SUM(CASE WHEN ({_rec_sql} = 'sell' AND effective_return<=0)
+                                   OR ({_rec_sql} != 'sell' AND effective_return>0)
+                                 THEN 1 ELSE 0 END) AS wins,
+                        AVG(LEAST(GREATEST(effective_return, %s), %s)) AS avg_ret,
+                        MAX(effective_return) AS best,
+                        MIN(effective_return) AS worst
+                    FROM pick_outcomes
+                    GROUP BY {_rec_sql}
+                    """,
+                    (-_OUTLIER_CAP, _OUTLIER_CAP),
+                )
+                for r in cur.fetchall():
+                    n = int(r[1] or 0)
+                    w = int(r[2] or 0)
+                    rec_breakdown[r[0]] = {
+                        "total": n,
+                        "wins": w,
+                        "winRate": (w / n * 100.0) if n else 0.0,
+                        "avgReturn": float(r[3] or 0.0),
+                        "bestReturn": float(r[4] or 0.0),
+                        "worstReturn": float(r[5] or 0.0),
+                        "outliers": 0,
+                    }
 
-    cumulative = []
-    running = 0.0
-    for p in sorted(traded, key=lambda x: x["pickedAt"]):
-        running += p["effectiveReturn2h"]
-        date_label = datetime.fromisoformat(p["pickedAt"]).strftime("%b %d")
-        cumulative.append({"date": date_label, "cumReturn": running})
+                # Cumulative return (score-derived buy+strong_buy, chronological)
+                cur.execute(
+                    f"""
+                    SELECT picked_at_utc, LEAST(GREATEST(effective_return, %s), %s)
+                    FROM pick_outcomes
+                    WHERE {_rec_sql} IN ('buy','strong_buy')
+                    ORDER BY picked_at_utc ASC
+                    """,
+                    (-_OUTLIER_CAP, _OUTLIER_CAP),
+                )
+                equity = 100.0
+                for r in cur.fetchall():
+                    ret_pct = float(r[1] or 0.0)
+                    # Guard against invalid <-100% rows from dirty price data.
+                    ret_pct = max(ret_pct, -95.0)
+                    equity *= (1.0 + ret_pct / 100.0)
+                    date_label = r[0].strftime("%b %d") if r[0] else ""
+                    cumulative.append({"date": date_label, "cumReturn": equity - 100.0})
 
-    # ── Per-chain & per-recommendation breakdown ──
-    chain_map: dict[str, list[dict]] = {}
-    rec_map: dict[str, list[dict]] = {}
-    for p in valid_2h:
-        c = p.get("chain", "base")
-        chain_map.setdefault(c, []).append(p)
-        rec_map.setdefault(p["recommendation"], []).append(p)
-
-    _OUTLIER_CAP = 500.0
-
-    def _stats(items: list[dict], long_only_avg: bool = False) -> dict:
-        n = len(items)
-        wins = sum(1 for x in items if _is_model_win(x))
-        # For chain breakdown: avg/best/worst only counts buy/strong_buy positions (sell = avoidance, no position taken).
-        # For rec breakdown: avg/best/worst is all picks in that group.
-        perf_items = [x for x in items if x["recommendation"] in LONG_LABELS] if long_only_avg else items
-        avg = (
-            sum(min(max(x["effectiveReturn2h"], -_OUTLIER_CAP), _OUTLIER_CAP) for x in perf_items) / len(perf_items)
-            if perf_items else 0.0
-        )
-        best = max((x["effectiveReturn2h"] for x in perf_items), default=0.0)
-        worst = min((x["effectiveReturn2h"] for x in perf_items), default=0.0)
-        outliers = sum(1 for x in perf_items if abs(x["effectiveReturn2h"]) > _OUTLIER_CAP)
-        return {"total": n, "wins": wins, "winRate": (wins / n * 100.0) if n else 0.0, "avgReturn": avg, "bestReturn": best, "worstReturn": worst, "outliers": outliers}
-
-    # Chain avg = only positions taken (buy/strong_buy); sell picks are avoidance signals, no position opened
-    chain_breakdown = {c: _stats(items, long_only_avg=True) for c, items in sorted(chain_map.items())}
-    rec_breakdown = {r: _stats(items) for r, items in sorted(rec_map.items())}
+    except Exception:
+        import traceback; traceback.print_exc()
 
     return {
         "rows": perf_rows,
@@ -755,7 +943,41 @@ def api_feature_importance():
         return json.load(f)
 
 
-@app.get("/api/settings")
+@app.get("/api/thresholds")
+def api_thresholds():
+    """Return the active score thresholds (calibrated or hardcoded defaults)."""
+    defaults = _DEFAULT_THRESHOLDS   # in 0-100 scale
+    if not THRESHOLDS_PATH.exists():
+        return {
+            "strongBuy":    defaults["strong_buy"],
+            "buy":          defaults["buy"],
+            "neutral":      defaults["neutral"],
+            "calibrated":   False,
+            "sampleSize":   0,
+            "calibratedAt": None,
+        }
+    try:
+        with open(THRESHOLDS_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return {
+            "strongBuy":    round(float(d.get("strong_buy", defaults["strong_buy"] / 100)) * 100, 1),
+            "buy":          round(float(d.get("buy",        defaults["buy"]        / 100)) * 100, 1),
+            "neutral":      round(float(d.get("neutral",    defaults["neutral"]    / 100)) * 100, 1),
+            "calibrated":   bool(d.get("calibrated", False)),
+            "sampleSize":   int(d.get("sample_size", 0)),
+            "calibratedAt": d.get("calibrated_at"),
+        }
+    except Exception:
+        return {
+            "strongBuy":    defaults["strong_buy"],
+            "buy":          defaults["buy"],
+            "neutral":      defaults["neutral"],
+            "calibrated":   False,
+            "sampleSize":   0,
+            "calibratedAt": None,
+        }
+
+
 def api_settings():
     def mask(v: str | None) -> str:
         if not v:

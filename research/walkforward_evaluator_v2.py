@@ -45,32 +45,36 @@ BASE_FEATURES = [
     "buy_sell_ratio",
     "trade_intensity",
     "wallet_growth_delta",
+    "wallet_momentum",
 ]
 
 CROSS_RANK_FEATURES = BASE_FEATURES + [
     "volume_velocity_rank_pct",
     "buy_sell_ratio_rank_pct",
     "trade_intensity_rank_pct",
+    "volume_relative_to_median",
 ]
 
 V2_FEATURES = CROSS_RANK_FEATURES + [
     "market_momentum_regime",
     "hour_sin",
     "hour_cos",
-    "volume_relative_to_median",
     "order_flow_imbalance",
-    # Chain one-hot (base is implicit baseline)
-    "is_bsc",
-    "is_solana",
-    "is_eth",
-    # Cooldown: minutes since last >=5% price spike (-1 = no spike in window)
     "minutes_since_last_spike",
+]
+
+MOMENTUM_PLUS_FEATURES = V2_FEATURES + [
+    "relative_momentum",
+    "volume_shock",
+    "macd_proxy",
+    "rsi_14",
 ]
 
 FEATURE_SETS = {
     "base": BASE_FEATURES,
     "cross_rank": CROSS_RANK_FEATURES,
     "v2": V2_FEATURES,
+    "momentum_plus": MOMENTUM_PLUS_FEATURES,
 }
 
 # Features that benefit from log1p transform (right-skewed or zero-inflated)
@@ -283,12 +287,12 @@ def make_xgboost(y_train: np.ndarray, **overrides: Any) -> XGBClassifier:
     params = dict(
         objective="binary:logistic",
         eval_metric="logloss",
-        n_estimators=250,
+        n_estimators=200,
         learning_rate=0.05,
         max_depth=3,
         min_child_weight=10,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        subsample=0.7,
+        colsample_bytree=0.7,
         reg_lambda=1.0,
         random_state=42,
         n_jobs=1,
@@ -329,6 +333,8 @@ def stacking_oof_predictions(
     y_train: np.ndarray,
     n_folds: int = 5,
     sample_weights: np.ndarray | None = None,
+    robust_fold_preprocess: bool = False,
+    feature_names: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate time-aware out-of-fold meta-features from 4 diverse base learners.
 
@@ -352,6 +358,12 @@ def stacking_oof_predictions(
         # Skip degenerate folds (too small or single class)
         if len(x_fold_tr) < 80 or len(np.unique(y_fold_tr)) < 2:
             continue
+
+        if robust_fold_preprocess:
+            if not feature_names:
+                raise ValueError("feature_names is required when robust_fold_preprocess=True")
+            # Fit preprocessing on fold-train only to avoid OOF leakage.
+            x_fold_tr, x_fold_te, _ = robust_preprocess(x_fold_tr, x_fold_te, feature_names=feature_names)
 
         sw_fold = sample_weights[train_idx] if sample_weights is not None else None
 
@@ -506,7 +518,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Walk-forward evaluator v2 — all improvements")
     parser.add_argument("--label-target", type=str, default="adaptive", choices=["fixed", "adaptive"])
     parser.add_argument("--model", type=str, default="stacking", choices=["logistic", "xgboost", "xgboost_tuned", "ensemble", "stacking"])
-    parser.add_argument("--feature-set", type=str, default="v2", choices=["base", "cross_rank", "v2"])
+    parser.add_argument("--feature-set", type=str, default="cross_rank", choices=["base", "cross_rank", "v2"])
     parser.add_argument("--preprocessing", type=str, default="robust", choices=["none", "robust"])
     parser.add_argument("--top-fraction", type=float, default=0.10)
     parser.add_argument("--train-fraction", type=float, default=0.60)

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -57,16 +58,190 @@ def _conn() -> psycopg.Connection:
     )
 
 
-def _score_to_recommendation(score: float) -> str:
-    """Same thresholds as backend/api.py (calibrated for adaptive top-20%)."""
-    pct = score * 100.0 if score <= 1.0 else score
-    if pct >= 55:
-        return "strong_buy"
-    if pct >= 45:
-        return "buy"
-    if pct >= 35:
-        return "neutral"
-    return "sell"
+# ---------------------------------------------------------------------------
+# Adaptive threshold calibration
+# ---------------------------------------------------------------------------
+
+# Stored next to the snapshot in research/
+_THRESHOLDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "score_thresholds.json")
+
+_DEFAULT_THRESHOLDS: dict = {
+    "strong_buy": 0.35,
+    "buy":        0.27,
+    "neutral":    0.20,
+    "calibrated": False,
+    "sample_size": 0,
+    "calibrated_at": None,
+}
+
+
+def load_thresholds() -> dict:
+    """Load calibrated thresholds from JSON; return defaults if file missing."""
+    try:
+        with open(_THRESHOLDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Validate required keys
+        if all(k in data for k in ("strong_buy", "buy", "neutral")):
+            return data
+    except Exception:
+        pass
+    return dict(_DEFAULT_THRESHOLDS)
+
+
+def compute_adaptive_thresholds(conn: psycopg.Connection) -> dict:
+    """Calibrate score thresholds by analysing pick_outcomes win rates per bucket.
+
+    Algorithm:
+      1. Group all real (non-backfill) pick_outcomes by 0.05-wide score buckets.
+      2. Compute cumulative win rate from the top score bucket downward.
+         Win = price went up (effective_return > 0) — direction-neutral,
+         so we measure pure raw predictive power of high scores.
+      3. The threshold for each label is the LOWEST score at which the cumulative
+         group (all picks scoring >= threshold) still meets the target win rate
+         with enough samples.
+      4. Write to research/score_thresholds.json for use by all processes.
+
+    Targets (based on market base-rate ~40% tokens going up):
+      strong_buy : cumulative win rate >= 58%  (need >= 30 picks)
+      buy        : cumulative win rate >= 52%  (need >= 20 picks)
+      neutral    : cumulative win rate >= 44%  (need >= 15 picks)
+      sell       : anything below neutral threshold
+
+    Falls back to hardcoded defaults when < 150 verified picks exist.
+    """
+    MIN_TOTAL      = 150    # minimum picks before calibrating
+    MIN_SB         = 30    # min picks in group for strong_buy threshold
+    MIN_BUY        = 20
+    MIN_NEUTRAL    = 15
+    TARGET_SB      = 0.58
+    TARGET_BUY     = 0.52
+    TARGET_NEUTRAL = 0.44
+
+    fallback = dict(_DEFAULT_THRESHOLDS)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH norm AS (
+                    SELECT
+                        CASE
+                            WHEN model_score <= 1.0 THEN model_score
+                            ELSE model_score / 100.0
+                        END AS score_norm,
+                        recommendation,
+                        effective_return
+                    FROM pick_outcomes
+                    WHERE model_score IS NOT NULL
+                      AND effective_return IS NOT NULL
+                )
+                SELECT
+                    FLOOR(score_norm / 0.05) * 0.05 AS bucket_low,
+                    COUNT(*)                         AS n,
+                    SUM(
+                        CASE
+                            WHEN recommendation = 'sell'  AND effective_return <= 0 THEN 1
+                            WHEN recommendation != 'sell' AND effective_return >  0 THEN 1
+                            ELSE 0
+                        END
+                    ) AS wins
+                FROM norm
+                GROUP BY 1
+                ORDER BY 1 DESC
+                """
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"[THRESHOLDS] DB error: {e}")
+        return fallback
+
+    total = sum(int(r[1]) for r in rows)
+    if total < MIN_TOTAL:
+        print(f"[THRESHOLDS] Only {total} verified picks — need {MIN_TOTAL} to calibrate, using defaults")
+        return fallback
+
+    cum_rows: list[tuple[float, int, float]] = []
+    cum_n = 0
+    cum_wins = 0
+    for bucket_low, n, wins in rows:
+        n_i = int(n)
+        wins_i = int(wins or 0)
+        cum_n += n_i
+        cum_wins += wins_i
+        cum_wr = (cum_wins / cum_n) if cum_n else 0.0
+        cum_rows.append((float(bucket_low), cum_n, cum_wr))
+
+    def _pick_threshold(target: float, min_n: int, default_value: float) -> float:
+        for score_low, n_i, wr_i in cum_rows:
+            if n_i >= min_n and wr_i >= target:
+                # cum_rows are ordered by score descending, so first match is
+                # the most selective threshold that still satisfies the target.
+                return score_low
+
+        # Guardrail: do not relax thresholds to very low values when target
+        # quality is not achieved. Keep stable defaults instead.
+        return default_value
+
+    sb_thresh = _pick_threshold(TARGET_SB, MIN_SB, fallback["strong_buy"])
+    buy_thresh = _pick_threshold(TARGET_BUY, MIN_BUY, fallback["buy"])
+    neu_thresh = _pick_threshold(TARGET_NEUTRAL, MIN_NEUTRAL, fallback["neutral"])
+
+    # Sanity: enforce ordering
+    sb_thresh  = max(sb_thresh,  buy_thresh)
+    buy_thresh = max(buy_thresh, neu_thresh)
+    neu_thresh = min(max(neu_thresh, 0.0), 1.0)
+
+    sb_thresh = min(max(sb_thresh, buy_thresh), 1.0)
+    buy_thresh = min(max(buy_thresh, neu_thresh), 1.0)
+
+    result = {
+        "strong_buy":    round(sb_thresh,  4),
+        "buy":           round(buy_thresh, 4),
+        "neutral":       round(neu_thresh, 4),
+        "calibrated":    True,
+        "sample_size":   total,
+        "calibrated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        with open(_THRESHOLDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+        print(
+            f"[THRESHOLDS] Calibrated from {total} picks → "
+            f"strong_buy>={sb_thresh:.2f}  buy>={buy_thresh:.2f}  neutral>={neu_thresh:.2f}"
+        )
+    except Exception as e:
+        print(f"[THRESHOLDS] Could not write {_THRESHOLDS_PATH}: {e}")
+
+    return result
+
+
+def _rank_recommendations(scores: list[float]) -> list[str]:
+    """Assign recommendations from absolute model score using adaptive thresholds.
+
+    Thresholds are loaded from research/score_thresholds.json (written by
+    compute_adaptive_thresholds after each calibration cycle).  Falls back to
+    hardcoded defaults when the file doesn't exist yet.
+
+    In a weak session where all scores are low there may be zero strong_buy
+    picks — that is the correct honest behaviour.
+    """
+    t = load_thresholds()
+    STRONG_BUY = t["strong_buy"]
+    BUY        = t["buy"]
+    NEUTRAL    = t["neutral"]
+
+    result: list[str] = []
+    for score in scores:
+        if score >= STRONG_BUY:
+            result.append("strong_buy")
+        elif score >= BUY:
+            result.append("buy")
+        elif score >= NEUTRAL:
+            result.append("neutral")
+        else:
+            result.append("sell")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +262,7 @@ CREATE TABLE IF NOT EXISTS pick_outcomes (
     return_2h       DOUBLE PRECISION,
     effective_return DOUBLE PRECISION,
     is_win          BOOLEAN,
+    is_backfill     BOOLEAN        NOT NULL DEFAULT FALSE,
     verified_at     TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
     inserted_at     TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_pick_outcomes
@@ -98,6 +274,11 @@ CREATE TABLE IF NOT EXISTS pick_outcomes (
 def ensure_table(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(CREATE_TABLE_SQL)
+        # Migration: add is_backfill column if the table already existed without it
+        cur.execute("""
+            ALTER TABLE pick_outcomes
+            ADD COLUMN IF NOT EXISTS is_backfill BOOLEAN NOT NULL DEFAULT FALSE
+        """)
     conn.commit()
 
 
@@ -137,6 +318,47 @@ def verify_and_store(
     wins = 0
     losses = 0
 
+    # -----------------------------------------------------------------------
+    # Pass 1: Validate rows and group by pick cycle (picked_at_utc)
+    # Only rows that are old enough, have a valid entry price, and haven't
+    # been stored yet are kept.  We group them so we can apply rank-based
+    # labeling within each cycle batch.
+    # -----------------------------------------------------------------------
+    from collections import defaultdict
+    # cycle_candidates[picked_at_utc] = list of candidate dicts
+    cycle_candidates: dict[datetime, list[dict]] = defaultdict(list)
+
+    # ------------------------------------------------------------------
+    # Batch dedup: one query to find ALL already-stored (token, bucket)
+    # pairs from the snapshot, avoiding N+1 queries inside the loop.
+    # ------------------------------------------------------------------
+    _pre_tokens: list[str] = []
+    _pre_buckets: list[datetime] = []
+    for _r in rows:
+        _tok = _r.get("token_address", "").strip()
+        _bkt = _r.get("bucket_timestamp", "")
+        if not _tok or not _bkt:
+            continue
+        try:
+            _bts = datetime.fromisoformat(_bkt)
+            if _bts.tzinfo is None:
+                _bts = _bts.replace(tzinfo=timezone.utc)
+            _pre_tokens.append(_tok)
+            _pre_buckets.append(_bts)
+        except Exception:
+            pass
+
+    stored_pairs: set[tuple] = set()
+    if _pre_tokens:
+        with conn.cursor() as _cur:
+            _cur.execute(
+                "SELECT token_address, bucket_timestamp FROM pick_outcomes"
+                " WHERE token_address = ANY(%s)"
+                " AND bucket_timestamp = ANY(%s::timestamptz[])",
+                (_pre_tokens, _pre_buckets),
+            )
+            stored_pairs = {(row[0], row[1]) for row in _cur.fetchall()}
+
     for r in rows:
         token = r.get("token_address", "").strip()
         if not token:
@@ -165,15 +387,10 @@ def verify_and_store(
             skipped += 1
             continue
 
-        # Check if already recorded
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM pick_outcomes WHERE token_address = %s AND bucket_timestamp = %s",
-                (token, bucket_ts),
-            )
-            if cur.fetchone():
-                already += 1
-                continue
+        # Check if already recorded (batch-preloaded set, no per-row query)
+        if (token, bucket_ts) in stored_pairs:
+            already += 1
+            continue
 
         # Get entry price
         try:
@@ -185,67 +402,107 @@ def verify_and_store(
             skipped += 1
             continue
 
-        score_raw = float(r.get("score", "0"))
-        recommendation = _score_to_recommendation(score_raw)
-        chain = r.get("chain", "base") or "base"
+        try:
+            score_raw = float(r.get("score", "0"))
+        except Exception:
+            score_raw = 0.0
 
-        # Look up 2h price
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT close_price::DOUBLE PRECISION
-                FROM token_price_5m
-                WHERE token_address = %s
-                  AND bucket_timestamp >= (%s::timestamptz + INTERVAL '2 hours')
-                ORDER BY bucket_timestamp ASC
-                LIMIT 1
-                """,
-                (token, bucket_ts),
+        cycle_candidates[picked_at].append({
+            "token": token,
+            "picked_at": picked_at,
+            "bucket_ts": bucket_ts,
+            "chain": r.get("chain", "base") or "base",
+            "score_raw": score_raw,
+            "entry_price": entry_price,
+            "symbol": r.get("symbol", token[:8]),
+            "row": r,
+        })
+
+    # -----------------------------------------------------------------------
+    # Pass 2: Rank within each cycle, look up 2h prices, store outcomes
+    # -----------------------------------------------------------------------
+    for picked_at, candidates in cycle_candidates.items():
+        scores = [c["score_raw"] for c in candidates]
+        recommendations = _rank_recommendations(scores)
+
+        for cand, recommendation in zip(candidates, recommendations):
+            token = cand["token"]
+            bucket_ts = cand["bucket_ts"]
+            entry_price = cand["entry_price"]
+            score_raw = cand["score_raw"]
+            chain = cand["chain"]
+
+            # Look up 2h price
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT close_price::DOUBLE PRECISION
+                    FROM token_price_5m
+                    WHERE token_address = %s
+                      AND bucket_timestamp >= (%s::timestamptz + INTERVAL '2 hours')
+                    ORDER BY bucket_timestamp ASC
+                    LIMIT 1
+                    """,
+                    (token, bucket_ts),
+                )
+                rec = cur.fetchone()
+
+            if not rec or rec[0] is None:
+                skipped += 1
+                continue
+
+            price_2h = float(rec[0])
+            return_2h = (price_2h - entry_price) / entry_price * 100.0
+
+            # Sanity-check: returns beyond ±500% are almost always caused by
+            # corrupted swap data (e.g. native-currency token mis-pricing,
+            # decimal-place errors).  Skip storing so they never pollute the
+            # accuracy metrics.  Log them so they can be investigated.
+            if abs(return_2h) > 500.0:
+                sym = cand["symbol"]
+                print(
+                    f"  [OUTLIER-SKIP] {sym:12s} {chain:6s} "
+                    f"entry={entry_price:.6g} price_2h={price_2h:.6g} "
+                    f"ret={return_2h:+.1f}% — NOT stored (price data corrupt)"
+                )
+                skipped += 1
+                continue
+
+            # All picks are long positions — no inversion
+            effective_return = return_2h
+            is_win = return_2h > 0
+
+            # Store outcome (is_backfill=FALSE → real live pick, used for sample weights)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pick_outcomes (
+                        token_address, chain, bucket_timestamp, picked_at_utc,
+                        model_score, recommendation, entry_price, price_2h,
+                        return_2h, effective_return, is_win, is_backfill, verified_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, NOW())
+                    ON CONFLICT (token_address, bucket_timestamp) DO NOTHING
+                    """,
+                    (
+                        token, chain, bucket_ts, picked_at,
+                        score_raw, recommendation, entry_price, price_2h,
+                        return_2h, effective_return, is_win,
+                    ),
+                )
+            conn.commit()
+
+            verified += 1
+            if is_win:
+                wins += 1
+            else:
+                losses += 1
+
+            sym = cand["symbol"]
+            print(
+                f"  [{'WIN' if is_win else 'LOSS'}] {sym:12s} {chain:6s} "
+                f"rec={recommendation:10s} score={score_raw:.4f} "
+                f"ret={return_2h:+.2f}%"
             )
-            rec = cur.fetchone()
-
-        if not rec or rec[0] is None:
-            skipped += 1
-            continue
-
-        price_2h = float(rec[0])
-        return_2h = (price_2h - entry_price) / entry_price * 100.0
-
-        # All picks are long positions — no inversion
-        effective_return = return_2h
-        is_win = return_2h > 0
-
-        # Store outcome
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO pick_outcomes (
-                    token_address, chain, bucket_timestamp, picked_at_utc,
-                    model_score, recommendation, entry_price, price_2h,
-                    return_2h, effective_return, is_win, verified_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (token_address, bucket_timestamp) DO NOTHING
-                """,
-                (
-                    token, chain, bucket_ts, picked_at,
-                    score_raw, recommendation, entry_price, price_2h,
-                    return_2h, effective_return, is_win,
-                ),
-            )
-        conn.commit()
-
-        verified += 1
-        if is_win:
-            wins += 1
-        else:
-            losses += 1
-
-        sym = r.get("symbol", token[:8])
-        print(
-            f"  [{'WIN' if is_win else 'LOSS'}] {sym:12s} {chain:6s} "
-            f"rec={recommendation:10s} score={score_raw:.4f} "
-            f"ret={return_2h:+.2f}%"
-        )
 
     total_verified = verified
     win_rate = (wins / total_verified * 100) if total_verified > 0 else 0
@@ -274,7 +531,7 @@ def load_feedback_weights(
     bucket_timestamps: list,
     base_weight: float = 1.0,
     win_boost: float = 1.5,
-    loss_boost: float = 3.0,
+    loss_boost: float = 4.5,
 ) -> np.ndarray:
     """Compute per-sample training weights using feedback outcomes.
 
@@ -299,10 +556,11 @@ def load_feedback_weights(
     """
     weights = np.full(len(token_addresses), base_weight, dtype=np.float64)
 
-    # Load all outcomes into a lookup set — include recommendation to judge model accuracy
+    # Load all outcomes into a lookup set — EXCLUDE backfilled rows (retroactive scoring
+    # by today's model; those picks don't reflect real decisions and must not bias weights)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT token_address, bucket_timestamp, is_win, return_2h, recommendation FROM pick_outcomes"
+            "SELECT token_address, bucket_timestamp, is_win, return_2h, recommendation FROM pick_outcomes WHERE is_backfill = FALSE"
         )
         outcomes = cur.fetchall()
 
@@ -339,7 +597,7 @@ def load_feedback_weights(
                 pass
             elif model_error:
                 # Model was directionally wrong — learn harder from this
-                magnitude = min(abs(ret) / 10.0, 3.0)  # cap at 3× additional
+                magnitude = min(abs(ret) / 8.0, 4.0)  # cap at 4x additional
                 weights[i] = loss_boost + magnitude
                 boosted += 1
             else:

@@ -6,21 +6,23 @@ A live crypto trading intelligence system that ingests 5-minute OHLCV data from 
 
 ## What this system does
 
-1. **Ingests** raw swap data from GeckoTerminal every 5 minutes across 4 chains
-2. **Builds** 5-minute OHLCV price candles, token metrics, feature signals and forward-return labels
-3. **Trains** a stacking ensemble (XGBoost + Random Forest + Extra Trees + Logistic meta-learner) on all labeled data with 3x loss-boosted sample weights for wrong past predictions
-4. **Picks** the top-N tokens by model score and logs them as live picks
-5. **Verifies** picks after 2 hours — records win/loss, effective return
-6. **Serves** a FastAPI backend (port 8001) consumed by a React/Vite frontend dashboard
-7. **Meme Radar** — scrapes Reddit/X for viral tokens and matches them against CoinStats
+1. **Ingests** raw swap data from GeckoTerminal every 5 minutes across four chains
+2. **Builds** 5-minute OHLCV price candles, token metrics, feature signals, and forward-return labels
+3. **Trains** a stacking ensemble (XGBoost + Random Forest + Extra Trees + Logistic Regression meta-learner) on all labeled data using feedback-based sample weighting from past prediction outcomes
+4. **Scores** tokens and selects the top-N by model probability each tick
+5. **Logs** picks and verifies them after two hours, recording win/loss and effective return in `pick_outcomes`
+6. **Enriches** token names from CoinStats after each cycle to replace temporary `TKN_` placeholders with real symbols
+7. **Serves** a FastAPI backend (port `8001`) consumed by a React/Vite frontend dashboard
+8. **Meme Radar** analyzes trending crypto mentions from Reddit/X and matches them against CoinStats coins
 
 ---
 
 ## Prerequisites
 
-- Python 3.11+
-- Node.js 18+ and npm
-- PostgreSQL 14+ running locally
+- Python **3.11+**
+- Node.js **18+**
+- npm
+- PostgreSQL **14+**
 - Git
 
 ---
@@ -37,6 +39,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+---
+
 ### 2. Configure environment
 
 ```powershell
@@ -46,7 +50,6 @@ copy .env.example .env
 Edit `.env` with your values:
 
 ```dotenv
-# PostgreSQL connection
 PGHOST=localhost
 PGPORT=5432
 PGDATABASE=crypto_momentum
@@ -54,37 +57,45 @@ PGUSER=postgres
 PGPASSWORD=your_password
 PGSSLMODE=disable
 
-# Ingestion settings
 INGEST_NETWORKS=base,eth,solana,bsc
 INGEST_MAX_POOLS=15
 INGEST_MAX_TRADES_PER_POOL=30
 INGEST_MAX_PAGES_PER_POOL=2
 INGEST_LOOKBACK_HOURS=24
 
-# CoinStats API key (required for market data + meme radar)
 COINSTATS_API_KEY=your_coinstats_key
 
-# Optional - only needed if using Alchemy as fallback
 ALCHEMY_API_KEY=
 ```
 
-### 3. Create the database and run all migrations in order
+---
+
+### 3. Create database and run migrations
 
 ```powershell
 psql -h localhost -p 5432 -U postgres -c "CREATE DATABASE crypto_momentum;"
+```
 
+Run migrations **in order**:
+
+```powershell
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/001_init_raw_schema.sql
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/002_create_token_metrics_5m.sql
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/003_create_features_5m.sql
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/004_create_labels_5m.sql
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/005_create_tracked_pools.sql
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/006_create_token_price_5m.sql
-psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/007_create_model_picks.sql
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/008_add_context_features_to_features_5m.sql
 psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/009_add_cross_sectional_rank_features.sql
+psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/010_add_regime_and_time_features.sql
+psql -h localhost -p 5432 -U postgres -d crypto_momentum -f db/migrations/011_add_adaptive_label_columns.sql
 ```
 
-Run them in number order. If a migration fails, check the previous one ran first.
+Run them sequentially. If a migration fails, confirm the previous migration completed successfully.
+
+> Note: migration number **007 intentionally does not exist**.
+
+---
 
 ### 4. Install frontend dependencies
 
@@ -98,7 +109,9 @@ cd ..\..
 
 ## Running the system
 
-Open **three** terminal windows from the project root:
+Open **three terminals** from the project root.
+
+---
 
 ### Terminal 1 — FastAPI backend
 
@@ -106,7 +119,13 @@ Open **three** terminal windows from the project root:
 .\runbackend.ps1
 ```
 
-Starts FastAPI on `http://127.0.0.1:8001` with hot-reload. Serves all API endpoints.
+Starts FastAPI at:
+
+```
+http://127.0.0.1:8001
+```
+
+---
 
 ### Terminal 2 — React frontend
 
@@ -114,42 +133,55 @@ Starts FastAPI on `http://127.0.0.1:8001` with hot-reload. Serves all API endpoi
 .\runfrontend.ps1
 ```
 
-Starts Vite dev server. Open `http://localhost:5173` in your browser.
+Open:
 
-### Terminal 3 — Live pipeline (continuous loop)
+```
+http://localhost:5173
+```
+
+---
+
+### Terminal 3 — Live pipeline
 
 ```powershell
 .\runlive.ps1 -Loop -LoopIntervalMinutes 5 -TopN 50 -IngestMaxPools 15
 ```
 
-Runs a full cycle every 5 minutes:
+Each cycle performs:
 
-1. Ingests swap data from GeckoTerminal
-2. Builds price candles, metrics, features, labels
-3. Trains stacking ensemble with feedback weights
-4. Saves top-50 picks to `research/live_picks_snapshot.csv` and `model_picks` DB table
-5. Verifies picks that are 2h old and records win/loss
+1. Swap ingestion from GeckoTerminal
+2. Candle generation
+3. Feature and label construction
+4. Stacking model training
+5. Top-N token scoring
+6. Pick logging
+7. Token name enrichment
+8. Pick verification after 2 hours
 
-#### One-shot single tick (no loop)
+---
+
+### Single tick run
 
 ```powershell
 .\runlive.ps1 -TickCount 1
 ```
 
+Runs the full pipeline **once** without looping.
+
 ---
 
 ## Pipeline parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `-Loop` | off | Run continuously every N minutes |
-| `-LoopIntervalMinutes` | 5 | Minutes between ticks |
-| `-TopN` | 50 | Number of tokens to score and pick |
-| `-IngestMaxPools` | 15 | Max GeckoTerminal pools to ingest per tick |
-| `-IngestMaxPagesPerPool` | 2 | Pages of trades per pool |
-| `-IngestMaxTradesPerPool` | 30 | Max trades fetched per pool |
-| `-IngestLookbackHours` | 24 | Historical lookback window |
-| `-MarketApi` | coinstats | Market data source for price enrichment |
+| Parameter                 | Default   | Description                        |
+| ------------------------- | --------- | ---------------------------------- |
+| `-Loop`                   | off       | Run pipeline continuously          |
+| `-LoopIntervalMinutes`    | 5         | Interval between ticks             |
+| `-TopN`                   | 50        | Number of tokens selected per tick |
+| `-IngestMaxPools`         | 15        | Maximum pools ingested             |
+| `-IngestMaxPagesPerPool`  | 2         | Pages fetched per pool             |
+| `-IngestMaxTradesPerPool` | 30        | Max trades fetched                 |
+| `-IngestLookbackHours`    | 24        | Historical window                  |
+| `-MarketApi`              | coinstats | Market data provider               |
 
 ---
 
@@ -159,111 +191,194 @@ Runs a full cycle every 5 minutes:
 GeckoTerminal API
       |
       v
-swaps_raw              <- raw immutable swap events (layer 0)
+swaps_raw
       |
       v
-token_price_5m         <- OHLCV candles from swap ratios (layer 1)
+token_price_5m
       |
       v
-token_metrics_5m       <- aggregated volume, wallet, trade counts (layer 2)
+token_metrics_5m
       |
       v
-features_5m            <- ML feature signals: velocity, intensity, rank (layer 3)
+features_5m
       |
       v
-labels_5m              <- forward return targets (future_return_2h, target_up_5pct_2h) (layer 4)
+labels_5m
       |
       v
-Stacking Ensemble      <- XGBoost + RF + ET + Logistic meta, retrained each tick
+Stacking Ensemble
       |
       v
-model_picks            <- top-N picks with recommendation + entry price
+pick_outcomes
       |
       v
-FastAPI (port 8001)    <- REST API consumed by dashboard
+FastAPI (port 8001)
       |
       v
-React Dashboard        <- Live Picks, Performance, Meme Radar, Feature Importance
+React Dashboard
 ```
 
 ---
 
 ## ML model details
 
-- **Architecture**: Stacking ensemble — XGBoost, Random Forest, Extra Trees as base learners; Logistic Regression as meta-learner
-- **Feature sets**: `v2` (default), `cross_rank`, `base`
-- **Label**: `target_up_5pct_2h` — binary, 1 if price rises >5% within 2 hours
-- **Training**: Retrains on every tick using all rows with a closed 2h label window (~17K-30K rows)
-- **Feedback weights**: Wrong predictions get 3-6x sample weight so the model learns harder from mistakes. Wins get 1.5x reinforcement.
-- **Pump guard**: Tokens with >30% 24h price change are capped to Neutral to avoid chasing pumps
+**Architecture**
 
-### Model recommendations
+Stacking ensemble:
 
-| Label | Meaning |
-|-------|---------|
-| `strong_buy` | High probability of >5% gain in 2h — enter position |
-| `buy` | Moderate probability — enter position |
-| `neutral` | No strong directional signal — no position |
-| `sell` | Model predicts no gain / likely decline — avoid / exit |
+- XGBoost
+- Random Forest
+- Extra Trees
+- Logistic Regression meta-learner
 
-Only `buy` and `strong_buy` picks contribute to portfolio avg return. Sell picks are avoidance signals — no position is opened.
+---
+
+**Feature sets**
+
+- `v2`
+- `cross_rank`
+- `base`
+
+---
+
+**Label**
+
+```
+target_adaptive_top20
+```
+
+Top 20% tokens by forward return per 5-minute bucket.
+
+---
+
+**Training**
+
+- Retrained every pipeline tick
+- Uses rows with closed 2-hour label windows
+- Typical dataset size: **17k–30k rows**
+
+---
+
+**Feedback weighting**
+
+| Outcome            | Sample weight |
+| ------------------ | ------------- |
+| Wrong prediction   | 3–6x          |
+| Correct prediction | 1.5x          |
+
+This helps the model learn more strongly from past mistakes.
+
+---
+
+**Pump guard**
+
+Tokens with **>30% price change in 24h** are capped to `neutral` to avoid chasing pumps.
+
+---
+
+### Model recommendation labels
+
+| Label        | Meaning                         |
+| ------------ | ------------------------------- |
+| `strong_buy` | High probability of strong gain |
+| `buy`        | Moderate bullish signal         |
+| `neutral`    | No strong directional signal    |
+| `sell`       | Model predicts decline          |
+
+Only `buy` and `strong_buy` affect portfolio return metrics.
 
 ---
 
 ## Dashboard pages
 
-| Page | URL | Description |
-|------|-----|-------------|
-| Dashboard | `/` | Summary of latest tick |
-| Live Picks | `/live` | Current model picks with prices |
-| Performance | `/performance` | Win rate, avg return, chain/rec breakdown, verified history |
-| Meme Radar | `/meme-radar` | Reddit/X viral tokens matched against CoinStats |
-| Run Pipeline | `/run` | Trigger a manual pipeline tick from the UI |
-| Settings | `/settings` | Configuration |
+| Page         | URL            | Description          |
+| ------------ | -------------- | -------------------- |
+| Dashboard    | `/`            | Latest tick overview |
+| Live Picks   | `/live`        | Current model picks  |
+| Performance  | `/performance` | Win rate and returns |
+| Meme Radar   | `/meme-radar`  | Trending tokens      |
+| Run Pipeline | `/run`         | Trigger manual tick  |
+| Settings     | `/settings`    | Configuration panel  |
 
 ---
 
 ## Performance metrics explained
 
-- **Win Rate**: % of picks where model direction was correct (sell + price fell = win; buy + price rose = win)
-- **Avg Return (2h)**: Average effective 2h return across `buy`/`strong_buy` picks only, capped at +/-500% for outliers
-- **Best/Worst on chain cards**: Best and worst return among `buy`/`strong_buy` picks only (sell/neutral excluded)
-- **Outlier badge**: Appears on table rows where `|return| > 500%` — those picks are capped at 500% in avg calculation
+**Win Rate**
+
+Percentage of picks where prediction direction matched the price movement.
+
+**Avg Return (2h)**
+
+Average return across `buy` and `strong_buy` picks only.
+
+Returns are capped at:
+
+```
+±500%
+```
+
+to avoid outliers distorting averages.
+
+---
+
+**Best / Worst Chain Cards**
+
+Displays highest and lowest return among buy-type picks per chain.
+
+---
+
+**Outlier Badge**
+
+Shown when:
+
+```
+|return| > 500%
+```
+
+These values are clipped in average calculations.
 
 ---
 
 ## Key files
 
-| File | Purpose |
-|------|---------|
-| `run_full_live_cycle.py` | Orchestrates full tick: ingest -> features -> labels -> pick -> verify |
-| `runlive.ps1` | PowerShell wrapper to start the pipeline loop |
-| `runbackend.ps1` | Starts FastAPI backend (uvicorn, port 8001) |
-| `runfrontend.ps1` | Starts Vite dev server (port 5173) |
-| `backend/api.py` | All FastAPI endpoints |
-| `backend/meme_radar.py` | Reddit/X scraping + CoinStats coin matching |
-| `research/live_top_coins.py` | Model training + scoring + pick generation (runs each tick) |
-| `research/feedback_loop.py` | Win/loss outcome tracking + sample weight computation |
-| `research/live_picks_snapshot.csv` | Latest picks snapshot used for 2h verification |
-| `research/feature_importance.json` | Written after each tick with current feature importances |
-| `ingestion/data_sources/gecko_provider.py` | GeckoTerminal API client |
-| `pipeline.log` | Pipeline stdout log |
-| `pipeline_err.log` | Pipeline stderr log |
+| File                                       | Purpose                        |
+| ------------------------------------------ | ------------------------------ |
+| `run_full_live_cycle.py`                   | Orchestrates full pipeline     |
+| `runlive.ps1`                              | Pipeline launcher              |
+| `runbackend.ps1`                           | Starts FastAPI                 |
+| `runfrontend.ps1`                          | Starts frontend                |
+| `backend/api.py`                           | API endpoints                  |
+| `backend/meme_radar.py`                    | Meme detection system          |
+| `research/live_top_coins.py`               | Model training and scoring     |
+| `research/feedback_loop.py`                | Outcome tracking and weighting |
+| `research/live_picks_snapshot.csv`         | Snapshot used for verification |
+| `research/feature_importance.json`         | Model feature importances      |
+| `ingestion/data_sources/gecko_provider.py` | GeckoTerminal client           |
+| `pipeline.log`                             | Pipeline logs                  |
+| `pipeline_err.log`                         | Error logs                     |
 
 ---
 
 ## Checking pipeline status
 
 ```powershell
-# Is the pipeline running? (returns 1 or 2 if yes)
 (Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'run_full_live_cycle' } | Measure-Object).Count
+```
 
-# Last 20 lines of pipeline log
+View logs:
+
+```powershell
 Get-Content .\pipeline.log -Tail 20
+```
 
-# Last 10 lines of error log
+Errors:
+
+```powershell
 Get-Content .\pipeline_err.log -Tail 10
 ```
+
+---
 
 ## Stopping the pipeline
 
@@ -278,46 +393,117 @@ Write-Host "Stopped $($procs.Count) process(es)"
 ## Database quick checks
 
 ```sql
--- Row counts per table
 SELECT COUNT(*) FROM swaps_raw;
 SELECT COUNT(*) FROM token_price_5m;
 SELECT COUNT(*) FROM features_5m;
 SELECT COUNT(*) FROM labels_5m WHERE future_return_2h IS NOT NULL;
+```
 
--- Latest model picks
-SELECT symbol, chain, recommendation, picked_at_utc, score
-FROM model_picks ORDER BY picked_at_utc DESC LIMIT 20;
+Latest verified picks:
 
--- Latest verified picks with returns
-SELECT symbol, recommendation, return_2h, is_win
-FROM model_picks WHERE return_2h IS NOT NULL
-ORDER BY picked_at_utc DESC LIMIT 20;
+```sql
+SELECT symbol, recommendation, effective_return, is_win, picked_at_utc
+FROM pick_outcomes
+ORDER BY picked_at_utc DESC
+LIMIT 20;
+```
+
+Win rate by recommendation:
+
+```sql
+SELECT recommendation,
+COUNT(*) AS total,
+SUM(CASE WHEN is_win THEN 1 ELSE 0 END) AS wins,
+ROUND(AVG(effective_return)::NUMERIC, 2) AS avg_return_pct
+FROM pick_outcomes
+GROUP BY recommendation
+ORDER BY recommendation;
+```
+
+Check placeholder tokens:
+
+```sql
+SELECT COUNT(*) AS placeholder_tokens
+FROM tokens
+WHERE symbol LIKE 'TKN_%';
 ```
 
 ---
 
 ## Troubleshooting
 
-**Pipeline hangs on pool X/Y**
-GeckoTerminal rate-limiting mid-ingest. Pool gets skipped after retries. Normal behaviour — reduce with `-IngestMaxPools 10`.
+**Pipeline stalls during ingestion**
+
+Likely GeckoTerminal rate limiting. Reduce ingestion volume:
+
+```
+-IngestMaxPools 10
+```
+
+---
 
 **No picks generated**
-Labels need a closed 2h window to exist. After first ingest, wait ~2 hours before picks appear.
 
-**"No meme-coin matches found" in Meme Radar**
-Check `COINSTATS_API_KEY` is set in `.env`. Also normal if trending posts don't mention known coins by name.
+Labels require a **2-hour window** to close. Picks appear only after sufficient historical data exists.
 
-**Frontend shows stale data**
-Performance data polls every 5 minutes. Hard-refresh (Ctrl+Shift+R) or wait for next poll.
+---
 
-**`psycopg2` not found in terminal**
-The `.venv` uses `psycopg` v3, not `psycopg2`. Always use `.venv\Scripts\python.exe` for pipeline commands. For raw DB queries use pgAdmin or `psql` directly.
+**Meme Radar shows no matches**
+
+Verify `COINSTATS_API_KEY` is configured correctly in `.env`.
+
+---
+
+**Placeholder token names appear**
+
+Run the enrichment script once:
+
+```powershell
+.\.venv\Scripts\python.exe research\enrich_token_names.py
+```
+
+---
+
+**Frontend showing stale data**
+
+- Live picks refresh every **10 seconds**
+- Performance refresh every **15 seconds**
+
+Hard refresh if needed.
+
+---
+
+**Database driver issue**
+
+The environment uses:
+
+```
+psycopg v3
+```
+
+not `psycopg2`. Always run scripts using the `.venv` Python interpreter.
 
 ---
 
 ## Deployment note
 
-This system is **not suitable for free-tier cloud** due to the ML retrain every 5 minutes on 17K+ rows.
+This system retrains an ML model every **5 minutes**, which requires a small VPS.
 
-- Frontend: Vercel or Netlify (free)
-- Backend + Pipeline + PostgreSQL: $6/month Hetzner VPS (2 vCPU, 2 GB RAM) or DigitalOcean Droplet
+Recommended deployment:
+
+| Component          | Platform         |
+| ------------------ | ---------------- |
+| Frontend           | Vercel / Netlify |
+| Backend + Pipeline | VPS              |
+| Database           | PostgreSQL       |
+
+Example VPS:
+
+```
+Hetzner CX21
+2 vCPU
+2 GB RAM
+≈ $6/month
+```
+
+or a similar DigitalOcean droplet.

@@ -16,6 +16,28 @@ from getpass import getpass
 import psycopg
 from dotenv import load_dotenv
 
+# Tokens whose on-chain "amount_token" may be in raw units (lamports/wei)
+# rather than human-readable units, producing prices that are off by 9-18
+# orders of magnitude and causing multi-billion-% phantom returns.
+_NATIVE_CURRENCY_ADDRESSES: frozenset[str] = frozenset({
+    "so11111111111111111111111111111111111111111",   # WSOL (Solana native)
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH (Ethereum native)
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB (BSC native)
+    "0x4200000000000000000000000000000000000006",   # WETH on Base / Optimism
+})
+
+# SQL fragment reused in both queries.
+_NATIVE_BLOCK_SQL = ", ".join(
+    f"'{addr}'" for addr in _NATIVE_CURRENCY_ADDRESSES
+)
+
+# Reject computed prices outside this range (USD per token).
+# Lower bound 1e-15 catches truly impossible values while keeping
+# legitimate ultra-low-priced meme tokens (e.g. $8e-8 is valid).
+# Upper bound $50 M blocks clearly impossible raw-unit-scale artefacts.
+_PRICE_MIN = 1e-15
+_PRICE_MAX = 50_000_000.0
+
 
 @dataclass
 class PriceBuildStats:
@@ -54,7 +76,7 @@ def build_token_price_5m(max_swaps: int) -> PriceBuildStats:
 
             # Count eligible swaps (ones with USD pricing data).
             cursor.execute(
-                """
+                f"""
                 SELECT COUNT(*)
                 FROM (
                     SELECT id
@@ -63,6 +85,8 @@ def build_token_price_5m(max_swaps: int) -> PriceBuildStats:
                       AND amount_token IS NOT NULL
                       AND amount_token <> 0
                       AND amount_usd > 0
+                      AND LOWER(token_address) NOT IN ({_NATIVE_BLOCK_SQL})
+                      AND (amount_usd / amount_token) BETWEEN {_PRICE_MIN} AND {_PRICE_MAX}
                     ORDER BY timestamp DESC
                     LIMIT %s
                 ) priced
@@ -80,7 +104,7 @@ def build_token_price_5m(max_swaps: int) -> PriceBuildStats:
             # High  = max price in the bucket
             # Low   = min price in the bucket
             cursor.execute(
-                """
+                f"""
                 WITH priced_swaps AS (
                     SELECT
                         token_address,
@@ -92,6 +116,8 @@ def build_token_price_5m(max_swaps: int) -> PriceBuildStats:
                       AND amount_token IS NOT NULL
                       AND amount_token <> 0
                       AND amount_usd > 0
+                      AND LOWER(token_address) NOT IN ({_NATIVE_BLOCK_SQL})
+                      AND (amount_usd / amount_token) BETWEEN {_PRICE_MIN} AND {_PRICE_MAX}
                     ORDER BY timestamp DESC
                     LIMIT %s
                 ),

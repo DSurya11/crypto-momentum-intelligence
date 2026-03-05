@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-03-05T12:06:19.569550+00:00",
+  "model": "stacking",
+  "featureSet": "cross_rank",
+  "trainRows": 6929,
+  "scoringRows": 56,
+  "features": {
+    "volume_velocity": 8.53,
+    "buy_sell_ratio": 5.53,
+    "trade_intensity": 5.84,
+    "wallet_growth_delta": 7.14,
+    "volume_velocity_rank_pct": 8.15,
+    "buy_sell_ratio_rank_pct": 6.21,
+    "trade_intensity_rank_pct": 3.17,
+    "volume_relative_to_median": 6.78
+  }
+}

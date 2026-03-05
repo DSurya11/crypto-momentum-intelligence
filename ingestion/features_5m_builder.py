@@ -94,6 +94,21 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         AVG(total_volume) OVER (
                             PARTITION BY token_address
                             ORDER BY bucket_timestamp
+                            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                        ) AS total_volume_avg_30,
+                        AVG(close_price::DOUBLE PRECISION) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
+                            ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+                        ) AS close_sma_12,
+                        AVG(close_price::DOUBLE PRECISION) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
+                            ROWS BETWEEN 25 PRECEDING AND CURRENT ROW
+                        ) AS close_sma_26,
+                        AVG(total_volume) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
                             ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
                         ) AS total_volume_avg_1h,
                         AVG(trade_count::DOUBLE PRECISION) OVER (
@@ -139,6 +154,26 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             WHEN close_price IS NULL OR close_price_1h_ago IS NULL OR close_price_1h_ago = 0 THEN 0::DOUBLE PRECISION
                             ELSE (close_price::DOUBLE PRECISION / close_price_1h_ago::DOUBLE PRECISION) - 1::DOUBLE PRECISION
                         END AS return_1h,
+                        CASE
+                            WHEN close_price IS NULL OR prev_close_price IS NULL OR prev_close_price = 0 THEN 0::DOUBLE PRECISION
+                            ELSE (close_price::DOUBLE PRECISION / prev_close_price::DOUBLE PRECISION) - 1::DOUBLE PRECISION
+                        END AS return_5m,
+                        CASE
+                            WHEN total_volume_avg_30 IS NULL OR total_volume_avg_30 = 0 THEN 0::DOUBLE PRECISION
+                            ELSE (total_volume::DOUBLE PRECISION / total_volume_avg_30::DOUBLE PRECISION)
+                        END AS volume_shock,
+                        CASE
+                            WHEN close_sma_12 IS NULL OR close_sma_26 IS NULL THEN 0::DOUBLE PRECISION
+                            ELSE (close_sma_12 - close_sma_26)::DOUBLE PRECISION
+                        END AS macd_proxy,
+                        CASE
+                            WHEN close_price IS NULL OR prev_close_price IS NULL THEN 0::DOUBLE PRECISION
+                            ELSE GREATEST(close_price::DOUBLE PRECISION - prev_close_price::DOUBLE PRECISION, 0::DOUBLE PRECISION)
+                        END AS gain_5m,
+                        CASE
+                            WHEN close_price IS NULL OR prev_close_price IS NULL THEN 0::DOUBLE PRECISION
+                            ELSE GREATEST(prev_close_price::DOUBLE PRECISION - close_price::DOUBLE PRECISION, 0::DOUBLE PRECISION)
+                        END AS loss_5m,
                         -- 5-minute absolute price change for spike detection
                         CASE
                             WHEN close_price IS NULL OR prev_close_price IS NULL OR prev_close_price = 0 THEN 0::DOUBLE PRECISION
@@ -156,6 +191,11 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         trade_intensity,
                         wallet_growth_delta,
                         return_1h,
+                        return_5m,
+                        volume_shock,
+                        macd_proxy,
+                        gain_5m,
+                        loss_5m,
                         price_change_5m_abs,
                         (volume_velocity - COALESCE(
                             LAG(volume_velocity) OVER (
@@ -190,7 +230,21 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             WHEN (buy_volume + sell_volume) = 0 THEN 0::DOUBLE PRECISION
                             ELSE ((buy_volume - sell_volume)::DOUBLE PRECISION / (buy_volume + sell_volume)::DOUBLE PRECISION)
                         END AS order_flow_imbalance,
-                        -- last bucket timestamp where price spiked >= 5% (for cooldown feature)
+                        COALESCE(
+                            AVG(return_5m) OVER (PARTITION BY bucket_timestamp, chain),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS chain_avg_return_5m,
+                        AVG(gain_5m) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
+                            ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
+                        )::DOUBLE PRECISION AS avg_gain_14,
+                        AVG(loss_5m) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
+                            ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
+                        )::DOUBLE PRECISION AS avg_loss_14,
+                        -- last bucket timestamp where price spiked >= 5%% (for cooldown feature)
                         MAX(CASE WHEN price_change_5m_abs >= 0.05 THEN bucket_timestamp ELSE NULL END)
                             OVER (
                                 PARTITION BY token_address
@@ -199,14 +253,15 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             ) AS last_spike_ts
                     FROM computed_base
                 ),
-                -- market-wide regime: fraction of tokens with positive return_1h in the same bucket
+                -- per-chain regime: fraction of tokens with positive return_1h in the same bucket+chain
                 regime_stats AS (
                     SELECT
                         bucket_timestamp,
+                        chain,
                         AVG(CASE WHEN return_1h > 0 THEN 1.0 ELSE 0.0 END)::DOUBLE PRECISION AS market_momentum_regime,
                         COALESCE(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY volume_velocity), 0)::DOUBLE PRECISION AS median_volume_velocity
                     FROM computed_ranks
-                    GROUP BY bucket_timestamp
+                    GROUP BY bucket_timestamp, chain
                 ),
                 computed AS (
                     SELECT
@@ -218,6 +273,15 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         r.wallet_growth_delta,
                         r.return_1h,
                         r.volume_accel,
+                        (r.return_5m - COALESCE(r.chain_avg_return_5m, 0))::DOUBLE PRECISION AS relative_momentum,
+                        (r.return_5m - (r.return_1h / 12.0))::DOUBLE PRECISION AS momentum_acceleration,
+                        r.volume_shock,
+                        r.macd_proxy,
+                        CASE
+                            WHEN COALESCE(r.avg_loss_14, 0) = 0 THEN
+                                CASE WHEN COALESCE(r.avg_gain_14, 0) > 0 THEN 100::DOUBLE PRECISION ELSE 50::DOUBLE PRECISION END
+                            ELSE (100.0 - (100.0 / (1.0 + (r.avg_gain_14 / NULLIF(r.avg_loss_14, 0)))))::DOUBLE PRECISION
+                        END AS rsi_14,
                         r.volume_velocity_rank_pct,
                         r.buy_sell_ratio_rank_pct,
                         r.trade_intensity_rank_pct,
@@ -231,17 +295,13 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             WHEN COALESCE(s.median_volume_velocity, 0) = 0 THEN 0::DOUBLE PRECISION
                             ELSE (r.volume_velocity / s.median_volume_velocity)::DOUBLE PRECISION
                         END AS volume_relative_to_median,
-                        -- minutes since last >=5% price spike (-1 if no spike in data window)
+                        -- minutes since last >=5%% price spike (-1 if no spike in data window)
                         COALESCE(
                             EXTRACT(EPOCH FROM (r.bucket_timestamp - r.last_spike_ts)) / 60.0,
                             -1.0
-                        )::DOUBLE PRECISION AS minutes_since_last_spike,
-                        -- chain one-hot (base is implicit baseline, excluded to avoid multicollinearity)
-                        CASE WHEN r.chain = 'bsc'    THEN 1.0 ELSE 0.0 END::DOUBLE PRECISION AS is_bsc,
-                        CASE WHEN r.chain = 'solana' THEN 1.0 ELSE 0.0 END::DOUBLE PRECISION AS is_solana,
-                        CASE WHEN r.chain = 'eth'    THEN 1.0 ELSE 0.0 END::DOUBLE PRECISION AS is_eth
+                        )::DOUBLE PRECISION AS minutes_since_last_spike
                     FROM computed_ranks r
-                    LEFT JOIN regime_stats s ON r.bucket_timestamp = s.bucket_timestamp
+                    LEFT JOIN regime_stats s ON r.bucket_timestamp = s.bucket_timestamp AND r.chain = s.chain
                 )
                 INSERT INTO features_5m (
                     token_address,
@@ -252,6 +312,11 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     wallet_growth_delta,
                     return_1h,
                     volume_accel,
+                    relative_momentum,
+                    momentum_acceleration,
+                    volume_shock,
+                    macd_proxy,
+                    rsi_14,
                     volume_velocity_rank_pct,
                     buy_sell_ratio_rank_pct,
                     trade_intensity_rank_pct,
@@ -260,10 +325,7 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     hour_cos,
                     volume_relative_to_median,
                     order_flow_imbalance,
-                    minutes_since_last_spike,
-                    is_bsc,
-                    is_solana,
-                    is_eth
+                    minutes_since_last_spike
                 )
                 SELECT
                     token_address,
@@ -274,6 +336,11 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     wallet_growth_delta,
                     return_1h,
                     volume_accel,
+                    relative_momentum,
+                    momentum_acceleration,
+                    volume_shock,
+                    macd_proxy,
+                    rsi_14,
                     volume_velocity_rank_pct,
                     buy_sell_ratio_rank_pct,
                     trade_intensity_rank_pct,
@@ -282,10 +349,7 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     hour_cos,
                     volume_relative_to_median,
                     order_flow_imbalance,
-                    minutes_since_last_spike,
-                    is_bsc,
-                    is_solana,
-                    is_eth
+                    minutes_since_last_spike
                 FROM computed
                 ON CONFLICT (token_address, bucket_timestamp)
                 DO UPDATE SET
@@ -295,6 +359,11 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     wallet_growth_delta = EXCLUDED.wallet_growth_delta,
                     return_1h = EXCLUDED.return_1h,
                     volume_accel = EXCLUDED.volume_accel,
+                    relative_momentum = EXCLUDED.relative_momentum,
+                    momentum_acceleration = EXCLUDED.momentum_acceleration,
+                    volume_shock = EXCLUDED.volume_shock,
+                    macd_proxy = EXCLUDED.macd_proxy,
+                    rsi_14 = EXCLUDED.rsi_14,
                     volume_velocity_rank_pct = EXCLUDED.volume_velocity_rank_pct,
                     buy_sell_ratio_rank_pct = EXCLUDED.buy_sell_ratio_rank_pct,
                     trade_intensity_rank_pct = EXCLUDED.trade_intensity_rank_pct,
@@ -304,9 +373,6 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     volume_relative_to_median = EXCLUDED.volume_relative_to_median,
                     order_flow_imbalance = EXCLUDED.order_flow_imbalance,
                     minutes_since_last_spike = EXCLUDED.minutes_since_last_spike,
-                    is_bsc = EXCLUDED.is_bsc,
-                    is_solana = EXCLUDED.is_solana,
-                    is_eth = EXCLUDED.is_eth,
                     updated_at = NOW()
                 """,
                 (max_metric_rows,),

@@ -1,0 +1,8 @@
+{
+  "strong_buy": 0.35,
+  "buy": 0.27,
+  "neutral": 0.2,
+  "calibrated": true,
+  "sample_size": 2393,
+  "calibrated_at": "2026-03-05T17:56:45.956400+00:00"
+}

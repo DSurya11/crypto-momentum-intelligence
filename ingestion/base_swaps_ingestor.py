@@ -208,9 +208,17 @@ def ingest_network(network: str) -> None:
     alchemy_approx_blocks_per_hour = int(get_env("ALCHEMY_APPROX_BLOCKS_PER_HOUR", "1800"))
 
     # Load pool addresses from DB (tracked_pools table).
-    # Falls back to ALCHEMY_POOL_ADDRESSES env var or empty list.
+    # For gecko provider: always use dynamic trending discovery (ignore tracked_pools)
+    #   so every chain fetches fresh hot pools each cycle, not stale historical ones.
+    # For alchemy provider: tracked_pools are required (no dynamic discovery available).
     db_pool_addresses = load_pool_addresses_from_db(chain=network)
-    if db_pool_addresses:
+    if primary_source == "gecko":
+        pool_addresses = []
+        if db_pool_addresses:
+            print(f"Gecko mode: ignoring {len(db_pool_addresses)} tracked DB pools — using dynamic trending discovery")
+        else:
+            print("No DB pools found and no env pool addresses; provider will discover pools dynamically")
+    elif db_pool_addresses:
         pool_addresses = db_pool_addresses
         print(f"Loaded {len(pool_addresses)} tracked pools from DB for chain={network}")
     else:

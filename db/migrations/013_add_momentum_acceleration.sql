@@ -1,0 +1,4 @@
+SET TIME ZONE 'UTC';
+
+ALTER TABLE features_5m
+ADD COLUMN IF NOT EXISTS momentum_acceleration DOUBLE PRECISION;

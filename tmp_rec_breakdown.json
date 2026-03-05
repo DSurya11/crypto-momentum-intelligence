@@ -1,0 +1,22 @@
+{
+    "strong_buy":  {
+                       "winRate":  38.7,
+                       "avgReturn":  -1.9,
+                       "total":  372
+                   },
+    "buy":  {
+                "winRate":  42,
+                "avgReturn":  0.25,
+                "total":  414
+            },
+    "neutral":  {
+                    "winRate":  41.7,
+                    "avgReturn":  0.81,
+                    "total":  410
+                },
+    "sell":  {
+                 "winRate":  61.7,
+                 "avgReturn":  0.06,
+                 "total":  227
+             }
+}

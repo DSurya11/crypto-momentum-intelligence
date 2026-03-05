@@ -29,6 +29,7 @@ const REC_COLORS: Record<string, string> = {
 export default function PerformancePage() {
   const { data, isLoading } = useQuery({ queryKey: ["performance"], queryFn: () => backendApi.performance(200), refetchInterval: 15000 });
   const { data: impData } = useQuery({ queryKey: ["feature-importance"], queryFn: backendApi.featureImportance, refetchInterval: 30000 });
+  const { data: threshData } = useQuery({ queryKey: ["thresholds"], queryFn: backendApi.thresholds, refetchInterval: 30000 });
   const rows = data?.rows ?? [];
   const chart = data?.cumulative ?? [];
   const summary = data?.summary ?? { winRate: 0, avgReturn2h: 0, total: 0 };
@@ -260,6 +261,41 @@ export default function PerformancePage() {
           )}
         </div>
 
+        {/* ── Adaptive Score Thresholds ──────────────────────────── */}
+        <div className="glass-card rounded-xl p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="font-semibold flex items-center gap-2">
+              <Zap className="h-4 w-4 text-primary" />
+              Score Thresholds
+            </h2>
+            <div className="text-[11px] text-muted-foreground space-x-3">
+              {threshData?.calibrated
+                ? <span className="text-green-400">Auto-calibrated from {threshData.sampleSize.toLocaleString()} picks</span>
+                : <span className="text-yellow-400">Using defaults — need 150+ verified picks to calibrate</span>}
+              {threshData?.calibratedAt && <span>at {new Date(threshData.calibratedAt).toLocaleTimeString()}</span>}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            {[
+              { label: "Strong Buy", value: threshData?.strongBuy ?? 35, color: "text-green-400", bg: "bg-green-400/10", desc: "≥ this score" },
+              { label: "Buy",        value: threshData?.buy        ?? 27, color: "text-blue-400",  bg: "bg-blue-400/10",  desc: "≥ this score" },
+              { label: "Neutral",    value: threshData?.neutral    ?? 20, color: "text-slate-400", bg: "bg-slate-400/10", desc: "≥ this score" },
+              { label: "Sell",       value: threshData?.neutral    ?? 20, color: "text-red-400",   bg: "bg-red-400/10",   desc: "< neutral" },
+            ].map(({ label, value, color, bg, desc }) => (
+              <div key={label} className={`rounded-lg p-4 ${bg} flex flex-col gap-1`}>
+                <span className={`text-xs font-medium ${color}`}>{label}</span>
+                <span className={`text-2xl font-bold font-mono ${color}`}>
+                  {label === "Sell" ? `< ${value.toFixed(1)}` : `${value.toFixed(1)}%`}
+                </span>
+                <span className="text-[10px] text-muted-foreground">{desc}</span>
+              </div>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground mt-3">
+            Thresholds auto-adjust every cycle based on which score ranges historically achieve ≥58% (strong buy), ≥52% (buy), ≥44% (neutral) real win rates.
+          </p>
+        </div>
+
         {/* ── Feature Importance ────────────────────────────────── */}
         {impChartData.length > 0 && (
           <div className="glass-card rounded-xl p-6">
@@ -305,6 +341,7 @@ export default function PerformancePage() {
                 <TableRow className="border-border/50 hover:bg-transparent">
                   <TableHead>Token</TableHead>
                   <TableHead>Chain</TableHead>
+                  <TableHead>Score</TableHead>
                   <TableHead>Model Call</TableHead>
                   <TableHead>Picked At</TableHead>
                   <TableHead>Entry Price</TableHead>
@@ -320,6 +357,9 @@ export default function PerformancePage() {
                   <TableRow key={i} className="border-border/30 hover:bg-muted/30">
                     <TableCell className="font-semibold">{p.symbol}</TableCell>
                     <TableCell><ChainBadge chain={p.chain} /></TableCell>
+                    <TableCell className="font-mono text-sm">
+                      {p.scorePct !== undefined ? `${p.scorePct.toFixed(1)}%` : "—"}
+                    </TableCell>
                     <TableCell><LabelBadge label={p.recommendation} /></TableCell>
                     <TableCell className="text-sm text-muted-foreground">{new Date(p.pickedAt).toLocaleString()}</TableCell>
                     <TableCell className="font-mono text-sm">{formatInrFromUsd(p.pickedPrice)}</TableCell>
@@ -328,7 +368,7 @@ export default function PerformancePage() {
                     <TableCell className="font-mono text-sm">{p.price2h !== null ? formatInrFromUsd(p.price2h) : "—"}</TableCell>
                     <TableCell className={`font-mono text-sm ${(p.effectiveReturn2h ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                       {p.effectiveReturn2h !== null ? `${p.effectiveReturn2h >= 0 ? "+" : ""}${p.effectiveReturn2h.toFixed(2)}%` : "—"}
-                      {p.effectiveReturn2h !== null && Math.abs(p.effectiveReturn2h) > 500 && (p.recommendation === "buy" || p.recommendation === "strong_buy") && (
+                      {p.isOutlier && (p.recommendation === "buy" || p.recommendation === "strong_buy") && (
                         <span className="ml-1.5 inline-flex items-center text-[10px] font-semibold text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded" title="Extreme return — capped at ±500% for avg calculation">
                           ⚠ outlier
                         </span>
