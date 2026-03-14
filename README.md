@@ -484,6 +484,7 @@ psycopg v3
 not `psycopg2`. Always run scripts using the `.venv` Python interpreter.
 
 ---
+## Future Scope
 
 ## Deployment note
 
