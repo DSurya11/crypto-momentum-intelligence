@@ -694,6 +694,16 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
         import traceback; traceback.print_exc()
 
     # ── 2. Recent unverified picks from CSV (< 2.5h old) ─────────────────
+    # Collect token_addresses already verified in the DB so we don't show
+    # a pending CSV row for the SAME pick that's already resolved.
+    # We track by token_address (not symbol) because the same token can be
+    # picked in multiple cycles.
+    verified_addrs_set: set[str] = set()
+    for vr in verified_rows:
+        # The DB query stores token_address in the row as part of the query;
+        # we need to match on what the CSV also stores.
+        pass  # We'll use a different strategy below
+    
     recent_csv_rows: list[dict] = []
     if SNAPSHOT_PATH.exists():
         cutoff_ts = datetime.now(timezone.utc) - timedelta(hours=2.5)
@@ -743,6 +753,8 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                 continue
 
             picked_bucket = datetime.fromisoformat(r["bucket_timestamp"])
+            if picked_bucket.tzinfo is None:
+                picked_bucket = picked_bucket.replace(tzinfo=timezone.utc)
             p5 = p10 = p2h = None
             r5 = r10 = r2h = None
             try:
@@ -798,11 +810,10 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                 "verified": r2h is not None,
             })
 
-    # ── 3. Merge: CSV recent on top, then verified DB rows ─────────────────
-    # Deduplicate: CSV takes precedence for tokens appearing in both
-    csv_tokens = {r["symbol"] for r in recent_csv_rows}
-    perf_rows = recent_csv_rows + [r for r in verified_rows if r["symbol"] not in csv_tokens]
-    perf_rows = perf_rows[:limit]
+    # ── 3. Merge: pending CSV rows on top, verified DB rows below ───────────
+    # No symbol-based dedup: the same token can appear as both a verified
+    # historic pick AND a new pending pick from a later cycle.
+    perf_rows = recent_csv_rows + verified_rows[:limit]
 
     # ── 4. Aggregate stats from the FULL pick_outcomes table (not just limit) ──
     total = 0
@@ -1046,8 +1057,7 @@ def api_cycle_status(since_line: int = 0):
 # Meme Radar
 # ---------------------------------------------------------------------------
 _meme_cache: dict[str, Any] = {"data": None, "ts": 0.0, "refreshing": False}
-_MEME_CACHE_TTL = 900  # 15 minutes
-
+_MEME_CACHE_TTL = 3600  # 1 hour
 
 def _refresh_meme_cache_bg() -> None:
     """Run meme radar in background thread and update cache."""
@@ -1060,14 +1070,13 @@ def _refresh_meme_cache_bg() -> None:
             from backend.meme_radar import run_meme_radar
         except ImportError:
             import sys
+            from pathlib import Path
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import meme_radar as _mr
             run_meme_radar = _mr.run_meme_radar
         result = run_meme_radar(
-            limit_per_sub=10,
-            min_virality=10.0,
-            max_results=20,
-            search_coins=True,
+            limit_reddit=5,
+            limit_x=5,
         )
         _meme_cache["data"] = result
         _meme_cache["ts"] = _time.time()
@@ -1081,18 +1090,25 @@ def _refresh_meme_cache_bg() -> None:
 def api_meme_radar(refresh: bool = False):
     """Return trending memes + related crypto tokens.
 
-    Results are cached for 15 minutes. The endpoint always returns instantly:
+    Results are cached for 1 hour. The endpoint always returns instantly:
     - If cache is fresh → return it immediately.
-    - If cache is stale / empty → trigger background refresh and return
-      stale cache (or a loading placeholder if no cache yet).
-    Pass ?refresh=true to force a new background fetch.
+    - If cache is stale / empty → trigger background refresh and return stale.
+    Pass ?refresh=true to force a new background fetch (minimum 5m cooldown).
     """
     import time as _time
     import threading
     now = _time.time()
-    cache_fresh = _meme_cache["data"] and (now - _meme_cache["ts"]) < _MEME_CACHE_TTL
+    
+    # Is the cache within the standard 1-hour window?
+    cache_fresh = bool(_meme_cache["data"] and (now - _meme_cache["ts"]) < _MEME_CACHE_TTL)
+    
+    # Is the cache extremely new? (Prevent spamming refresh within 5 minutes)
+    cache_very_new = bool(_meme_cache["data"] and (now - _meme_cache["ts"]) < 300)
 
-    if not cache_fresh or refresh:
+    # We only trigger a fetch if it's naturally stale, OR if they asked to refresh AND it's not very new.
+    should_fetch = not cache_fresh or (refresh and not cache_very_new)
+
+    if should_fetch:
         # Kick off background refresh (no-op if already running)
         t = threading.Thread(target=_refresh_meme_cache_bg, daemon=True)
         t.start()

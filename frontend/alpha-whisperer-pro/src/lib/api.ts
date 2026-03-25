@@ -90,7 +90,7 @@ export const backendApi = {
     summary: { winRate: number; avgReturn2h: number; total: number };
     chainBreakdown?: Record<string, { total: number; wins: number; winRate: number; avgReturn: number; bestReturn: number; worstReturn: number }>;
     recBreakdown?: Record<string, { total: number; wins: number; winRate: number; avgReturn: number; bestReturn: number; worstReturn: number }>;
-  }>(`/api/performance?limit=${limit}&labels=strong_buy,buy,neutral,sell&verified_only=true`),
+  }>(`/api/performance?limit=${limit}&labels=strong_buy,buy,neutral,sell&verified_only=false`),
   settings: () => apiGet<{ env: Array<{ key: string; value: string; masked: boolean }> }>("/api/settings"),
   featureImportance: () => apiGet<{ features: Record<string, number>; timestamp: string | null; model: string | null; featureSet: string | null; trainRows: number; scoringRows: number }>("/api/feature-importance"),
   thresholds: () => apiGet<{ strongBuy: number; buy: number; neutral: number; calibrated: boolean; sampleSize: number; calibratedAt: string | null }>("/api/thresholds"),

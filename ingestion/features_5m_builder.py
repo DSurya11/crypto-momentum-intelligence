@@ -299,9 +299,11 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         COALESCE(
                             EXTRACT(EPOCH FROM (r.bucket_timestamp - r.last_spike_ts)) / 60.0,
                             -1.0
-                        )::DOUBLE PRECISION AS minutes_since_last_spike
+                        )::DOUBLE PRECISION AS minutes_since_last_spike,
+                        LN(1.0 + GREATEST(EXTRACT(EPOCH FROM (r.bucket_timestamp - t.created_at)) / 3600.0, 0))::DOUBLE PRECISION AS time_since_launch_log
                     FROM computed_ranks r
                     LEFT JOIN regime_stats s ON r.bucket_timestamp = s.bucket_timestamp AND r.chain = s.chain
+                    LEFT JOIN tokens t ON r.token_address = t.token_address
                 )
                 INSERT INTO features_5m (
                     token_address,
@@ -325,7 +327,8 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     hour_cos,
                     volume_relative_to_median,
                     order_flow_imbalance,
-                    minutes_since_last_spike
+                    minutes_since_last_spike,
+                    time_since_launch_log
                 )
                 SELECT
                     token_address,
@@ -349,7 +352,8 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     hour_cos,
                     volume_relative_to_median,
                     order_flow_imbalance,
-                    minutes_since_last_spike
+                    minutes_since_last_spike,
+                    time_since_launch_log
                 FROM computed
                 ON CONFLICT (token_address, bucket_timestamp)
                 DO UPDATE SET
@@ -373,6 +377,7 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     volume_relative_to_median = EXCLUDED.volume_relative_to_median,
                     order_flow_imbalance = EXCLUDED.order_flow_imbalance,
                     minutes_since_last_spike = EXCLUDED.minutes_since_last_spike,
+                    time_since_launch_log = EXCLUDED.time_since_launch_log,
                     updated_at = NOW()
                 """,
                 (max_metric_rows,),

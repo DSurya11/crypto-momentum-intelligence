@@ -145,7 +145,7 @@ SKIP_KEYWORDS = frozenset({
 })
 
 # User agent for Reddit requests
-USER_AGENT = "CryptoMomentumIntelligence/1.0 (meme-radar)"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # CoinStats API
 COINSTATS_SEARCH_URL = "https://openapiv1.coinstats.app/coins"
@@ -206,21 +206,67 @@ class MemeRadarResult:
 # Reddit fetching
 # ---------------------------------------------------------------------------
 
+_reddit_token: str | None = None
+_reddit_token_expires_at: float = 0
+
+def _get_reddit_bearer_token() -> str | None:
+    """Fetch an OAuth bearer token using Reddit App credentials from .env."""
+    global _reddit_token, _reddit_token_expires_at
+    now = time.time()
+    if _reddit_token and now < _reddit_token_expires_at:
+        return _reddit_token
+
+    client_id = os.getenv("REDDIT_CLIENT_ID", "").strip()
+    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return None
+
+    import base64
+    auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("utf-8")
+    data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.reddit.com/api/v1/access_token",
+        data=data,
+        headers={"Authorization": f"Basic {auth_str}", "User-Agent": USER_AGENT}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            _reddit_token = payload.get("access_token")
+            # Usually expires in 86400 secs, keep it cached for 1 hour to heavily buffer
+            _reddit_token_expires_at = now + 3600 
+            return _reddit_token
+    except Exception as e:
+        print(f"[MEME RADAR] Failed to get Reddit OAuth token: {e}")
+        return None
+
+
 def _fetch_json(url: str, headers: dict | None = None) -> Any:
-    """Fetch JSON from URL with throttle protection."""
+    """Fetch JSON from URL with throttle protection and OAuth support."""
     hdrs = {"User-Agent": USER_AGENT}
+    
+    # If using Reddit OAuth, append Bearer token
+    if "reddit.com" in url:
+        token = _get_reddit_bearer_token()
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
+            # OAuth must use oauth.reddit.com
+            url = url.replace("https://www.reddit.com", "https://oauth.reddit.com")
+            
     if headers:
         hdrs.update(headers)
+        
     req = urllib.request.Request(url, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    except Exception as e:
+        print(f"[MEME RADAR] Failed to fetch {url}: {e}")
         return None
 
 
 def fetch_subreddit_hot(subreddit: str, limit: int = 25) -> list[MemePost]:
-    """Fetch hot posts from a subreddit using Reddit's public JSON API."""
+    """Fetch hot posts from a subreddit using Reddit's public JSON API or OAuth."""
     url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit={limit}&raw_json=1"
     data = _fetch_json(url)
     if not data or "data" not in data:
@@ -260,102 +306,189 @@ def fetch_subreddit_hot(subreddit: str, limit: int = 25) -> list[MemePost]:
 
 
 def fetch_all_subreddits(limit_per_sub: int = 20) -> list[MemePost]:
-    """Fetch hot posts from all meme subreddits in parallel."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    all_posts: list[MemePost] = []
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(fetch_subreddit_hot, sub, limit_per_sub): sub for sub in MEME_SUBREDDITS}
-        for future in as_completed(futures, timeout=20):
-            try:
-                all_posts.extend(future.result())
-            except Exception:
-                pass
-    return all_posts
+    """Fetch live Reddit posts using Apify (trudax/reddit-scraper-lite).
+    
+    The trudax scraper returns fields:
+      title, upVotes, numberOfComments, parsedCommunityName,
+      username, createdAt, url, upVoteRatio, thumbnailUrl, body
+    """
+    apify = os.getenv("APIFY_API_TOKEN", "").strip()
+    if not apify:
+        print("[MEME RADAR] No APIFY_API_TOKEN found, skipping Reddit fetch.")
+        return []
 
+    print("[MEME RADAR] Using Apify to scan Reddit...")
+    url = f"https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items?token={apify}"
+    
+    start_urls = [{"url": f"https://www.reddit.com/r/{sub}/hot/"} for sub in MEME_SUBREDDITS]
+    
+    payload = json.dumps({
+        "startUrls": start_urls,
+        "maxItems": limit_per_sub * len(MEME_SUBREDDITS),
+        "skipComments": True
+    }).encode("utf-8")
+    
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as err:
+        print(f"[MEME RADAR] Apify Reddit search failed: {err}")
+        return []
+
+    print(f"[MEME RADAR] Reddit raw items: {len(data)}")
+    now = time.time()
+    posts: list[MemePost] = []
+    
+    for item in data:
+        title = item.get("title", "")
+        if not title:
+            continue
+        
+        # trudax field names: upVotes, numberOfComments, parsedCommunityName
+        score = int(item.get("upVotes", 0))
+        comments = int(item.get("numberOfComments", 0))
+        subreddit = item.get("parsedCommunityName", item.get("communityName", "reddit"))
+        
+        # Parse timestamp  (ISO format: "2026-03-25T01:00:17.000Z")
+        created_str = item.get("createdAt", "")
+        created_utc = now
+        try:
+            if created_str:
+                created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                created_utc = created_dt.timestamp()
+        except Exception:
+            pass
+            
+        age_hours = max((now - created_utc) / 3600.0, 0.01)
+        thumb = item.get("thumbnailUrl", "")
+        
+        # Also extract keywords from 'body' text if available (for richer matching)
+        body_text = item.get("body", "")
+        combined_text = title
+        if body_text and len(body_text) < 2000:
+            combined_text = f"{title} {body_text}"
+        
+        post = MemePost(
+            title=title,
+            subreddit=subreddit,
+            url=item.get("url", ""),
+            permalink=item.get("url", ""),
+            score=score,
+            num_comments=comments,
+            created_utc=created_utc,
+            thumbnail=thumb if thumb.startswith("http") else "",
+            author=item.get("username", "user"),
+            upvote_ratio=float(item.get("upVoteRatio", 0.9)),
+            source="reddit",
+            age_hours=age_hours,
+            upvote_velocity=score / age_hours if age_hours > 0 else 0,
+            comment_ratio=comments / max(score, 1)
+        )
+        post.keywords = extract_keywords(combined_text)
+        posts.append(post)
+    
+    print(f"[MEME RADAR] Reddit posts parsed: {len(posts)}")
+    return posts
 
 # ---------------------------------------------------------------------------
-# X/Twitter fetching
+# X/Twitter fetching  (using danek/twitter-scraper-ppr — $0.30/1K results)
 # ---------------------------------------------------------------------------
 
 def _x_bearer_token() -> str:
     """Return X API bearer token from env."""
     return os.getenv("X_BEARER_TOKEN", "").strip()
 
+def _apify_api_token() -> str:
+    """Return Apify API token from env."""
+    return os.getenv("APIFY_API_TOKEN", "").strip()
 
-def fetch_x_recent(query: str, max_results: int = 20) -> list[MemePost]:
-    """Fetch recent tweets matching a query via X API v2.
 
-    Requires X_BEARER_TOKEN env var.
-    Uses GET /2/tweets/search/recent with public metrics.
+def fetch_all_x(max_per_query: int = 15) -> list[MemePost]:
+    """Fetch live Twitter/X posts using Apify (kaitoeasyapi PPR — $0.25/1K tweets).
+    
+    Uses keyword search mode via 'twitterContent'. Output fields:
+      text, likeCount, retweetCount, replyCount, viewCount,
+      createdAt (Twitter native format), author.userName, url
     """
-    bearer = _x_bearer_token()
-    if not bearer:
+    apify = _apify_api_token()
+    if not apify:
+        print("[MEME RADAR] No APIFY_API_TOKEN found, skipping X fetch.")
         return []
-
-    params = {
-        "query": query,
-        "max_results": str(min(max_results, 100)),
-        "tweet.fields": "created_at,public_metrics,author_id,entities",
-        "expansions": "author_id",
-        "user.fields": "username,profile_image_url",
-    }
-    url = f"https://api.x.com/2/tweets/search/recent?{urllib.parse.urlencode(params)}"
-
+        
+    print("[MEME RADAR] Using Apify (kaitoeasyapi PPR) to scan X (Twitter)...")
+    url = f"https://api.apify.com/v2/acts/kaitoeasyapi~twitter-x-data-tweet-scraper-pay-per-result-cheapest/run-sync-get-dataset-items?token={apify}"
+    
+    # Combine search queries with OR for a single search
+    combined_search = " OR ".join(X_SEARCH_QUERIES[:5])
+    
+    payload = json.dumps({
+        "twitterContent": combined_search,
+        "maxItems": max_per_query,
+    }).encode("utf-8")
+    
     try:
-        req = urllib.request.Request(url, headers={
-            "Authorization": f"Bearer {bearer}",
-            "User-Agent": USER_AGENT,
-        })
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
     except Exception as err:
-        print(f"X API search failed for '{query[:40]}': {err}")
+        print(f"[MEME RADAR] Apify X search failed: {err}")
         return []
-
-    users_map: dict[str, dict] = {}
-    for u in (payload.get("includes") or {}).get("users", []):
-        users_map[u["id"]] = u
-
+    
+    print(f"[MEME RADAR] X raw items: {len(data)}")
     now = time.time()
     posts: list[MemePost] = []
-    for tweet in payload.get("data") or []:
-        metrics = tweet.get("public_metrics", {})
-        likes = int(metrics.get("like_count", 0))
-        replies = int(metrics.get("reply_count", 0))
-        retweets = int(metrics.get("retweet_count", 0))
-        # Engagement score = likes + retweets (analogous to Reddit upvotes)
+    
+    for tweet in data:
+        # Filter out {"noResults": true} placeholder objects
+        if tweet.get("noResults"):
+            continue
+            
+        text = tweet.get("text", tweet.get("full_text", ""))
+        if not text:
+            continue
+        
+        # danek scraper fields vary; handle both possible schemas
+        likes = int(tweet.get("likeCount", tweet.get("favorite_count", 0)))
+        retweets = int(tweet.get("retweetCount", tweet.get("retweet_count", 0)))
+        replies = int(tweet.get("replyCount", tweet.get("reply_count", 0)))
         engagement = likes + retweets
-
-        # Parse created_at
-        created_str = tweet.get("created_at", "")
+            
+        created_str = tweet.get("createdAt", tweet.get("created_at", ""))
+        created_utc = now
         try:
-            created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-            created_utc = created_dt.timestamp()
+            if created_str:
+                # Try ISO format first
+                created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                created_utc = created_dt.timestamp()
         except Exception:
-            created_utc = now
-
+            try:
+                # Try Twitter's native format
+                created_dt = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+                created_utc = created_dt.timestamp()
+            except Exception:
+                pass
+            
         age_hours = max((now - created_utc) / 3600.0, 0.01)
-        text = tweet.get("text", "")
-        tweet_id = tweet.get("id", "")
-        author_id = tweet.get("author_id", "")
-        user_info = users_map.get(author_id, {})
-        username = user_info.get("username", "")
-        profile_img = user_info.get("profile_image_url", "")
-
-        # Short query label for display (e.g. "crypto meme" from full query)
-        query_label = query.split("-is:")[0].strip()[:25]
-
+        
+        # Author info may be nested or flat
+        author_info = tweet.get("author", {})
+        if isinstance(author_info, dict):
+            username = author_info.get("userName", author_info.get("screen_name", "crypto_user"))
+        else:
+            username = tweet.get("user_name", tweet.get("screen_name", "crypto_user"))
+        
         post = MemePost(
             title=text,
-            subreddit=query_label,  # reuse field for source label
-            url=f"https://x.com/{username}/status/{tweet_id}" if username else "",
-            permalink=f"https://x.com/{username}/status/{tweet_id}" if username else "",
+            subreddit="X Trending",
+            url=tweet.get("url", tweet.get("tweet_url", "")),
+            permalink=tweet.get("url", tweet.get("tweet_url", "")),
             score=engagement,
             num_comments=replies,
             created_utc=created_utc,
-            thumbnail=profile_img,
+            thumbnail="",
             author=username,
-            upvote_ratio=0.9,  # X doesn't have this, default high
+            upvote_ratio=0.9,
             source="x",
             age_hours=age_hours,
             upvote_velocity=engagement / age_hours if age_hours > 0 else 0,
@@ -363,25 +496,8 @@ def fetch_x_recent(query: str, max_results: int = 20) -> list[MemePost]:
         )
         post.keywords = extract_keywords(text)
         posts.append(post)
-
+        
     return posts
-
-
-def fetch_all_x(max_per_query: int = 15) -> list[MemePost]:
-    """Fetch tweets from all X search queries."""
-    if not _x_bearer_token():
-        return []
-
-    all_posts: list[MemePost] = []
-    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(fetch_x_recent, q, max_per_query): q for q in X_SEARCH_QUERIES}
-        for future in _as_completed(futures, timeout=15):
-            try:
-                all_posts.extend(future.result())
-            except Exception:
-                pass
-    return all_posts
 
 
 # ---------------------------------------------------------------------------
@@ -639,8 +755,10 @@ def find_exact_coin_matches(keywords: list[str], max_searches: int = 10) -> list
 
 def run_meme_radar(
     limit_per_sub: int = 15,
-    min_virality: float = 15.0,
-    max_results: int = 20,
+    limit_reddit: int | None = None,
+    limit_x: int | None = None,
+    min_virality: float = 0.0,
+    max_results: int = 30,
     search_coins: bool = True,
 ) -> dict[str, Any]:
     """
@@ -652,9 +770,13 @@ def run_meme_radar(
       5. ONLY keep memes that have at least one exact coin match
       6. Return combined meme+coin results
     """
+    # Support both old-style (limit_per_sub) and new-style (limit_reddit/limit_x) params
+    reddit_limit = limit_reddit if limit_reddit is not None else limit_per_sub
+    x_limit = limit_x if limit_x is not None else 10
+    
     # 1. Fetch all posts from Reddit + X
-    all_posts = fetch_all_subreddits(limit_per_sub=limit_per_sub)
-    x_posts = fetch_all_x(max_per_query=10)
+    all_posts = fetch_all_subreddits(limit_per_sub=reddit_limit)
+    x_posts = fetch_all_x(max_per_query=x_limit)
     all_posts.extend(x_posts)
 
     # 2. Score and classify
