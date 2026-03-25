@@ -702,6 +702,7 @@ def main() -> None:
 
         # train one model per chain
         chain_models = {}
+        importances_per_chain: dict[str, dict[str, float]] = {}
         importances = {}
         tuned = {}
         probs = np.zeros(len(meta))
@@ -769,7 +770,8 @@ def main() -> None:
 
             chain_models[ch] = p
             tuned = tuned_params
-            importances = imp
+            importances_per_chain[ch] = imp
+            importances = imp  # fallback: last chain for combined view
 
         # choose score based on token chain
 
@@ -941,8 +943,36 @@ def main() -> None:
         print("-" * 110)
         print(f"Saved snapshot: {args.snapshot_path}")
 
-        # ── Save feature importances JSON ──
-        importance_path = os.path.join(os.path.dirname(args.snapshot_path) or ".", "feature_importance.json")
+        # ── Save feature importances JSON (per-chain + combined) ──
+        imp_dir = os.path.dirname(args.snapshot_path) or "."
+
+        # Per-chain importance files
+        for ch, ch_imp in importances_per_chain.items():
+            ch_path = os.path.join(imp_dir, f"feature_importance_{ch}.json")
+            ch_payload = {
+                "timestamp": now_utc,
+                "model": args.model,
+                "chain": ch,
+                "featureSet": args.feature_set,
+                "trainRows": len(chain_map.get(ch, [])),
+                "scoringRows": int(x_score.shape[0]),
+                "features": ch_imp,
+            }
+            with open(ch_path, "w", encoding="utf-8") as fj:
+                json.dump(ch_payload, fj, indent=2)
+
+        # Combined importance (average across chains)
+        if importances_per_chain:
+            all_features = set()
+            for ch_imp in importances_per_chain.values():
+                all_features.update(ch_imp.keys())
+            combined = {}
+            for fn in all_features:
+                vals = [ch_imp.get(fn, 0.0) for ch_imp in importances_per_chain.values()]
+                combined[fn] = round(sum(vals) / len(vals), 2)
+            importances = combined
+
+        importance_path = os.path.join(imp_dir, "feature_importance.json")
         imp_payload = {
             "timestamp": now_utc,
             "model": args.model,
@@ -950,6 +980,7 @@ def main() -> None:
             "trainRows": int(x_train.shape[0]),
             "scoringRows": int(x_score.shape[0]),
             "features": importances,
+            "perChain": {ch: imp for ch, imp in importances_per_chain.items()},
         }
         with open(importance_path, "w", encoding="utf-8") as fj:
             json.dump(imp_payload, fj, indent=2)

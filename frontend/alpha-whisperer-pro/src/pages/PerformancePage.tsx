@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { DashboardLayout } from "@/components/DashboardLayout";
 import { StatCard } from "@/components/StatCard";
 import { backendApi } from "@/lib/api";
@@ -26,7 +27,16 @@ const REC_COLORS: Record<string, string> = {
   sell: "#ef4444",
 };
 
+const IMP_CHAIN_TABS = [
+  { key: "all", label: "All Chains" },
+  { key: "eth", label: "ETH" },
+  { key: "solana", label: "SOL" },
+  { key: "bsc", label: "BSC" },
+  { key: "base", label: "Base" },
+];
+
 export default function PerformancePage() {
+  const [impChain, setImpChain] = useState("all");
   const { data, isLoading } = useQuery({ queryKey: ["performance"], queryFn: () => backendApi.performance(200), refetchInterval: 15000 });
   const { data: impData } = useQuery({ queryKey: ["feature-importance"], queryFn: backendApi.featureImportance, refetchInterval: 30000 });
   const { data: threshData } = useQuery({ queryKey: ["thresholds"], queryFn: backendApi.thresholds, refetchInterval: 30000 });
@@ -52,13 +62,16 @@ export default function PerformancePage() {
     fill: REC_COLORS[rec] ?? "#64748b",
   }));
 
-  const impFeatures = impData?.features ?? {};
-  const impChartData = Object.entries(impFeatures)
-    .sort(([, a], [, b]) => b - a)
+  // Per-chain feature importance
+  const perChainImp = (impData as any)?.perChain ?? {};
+  const activeImpFeatures = impChain === "all" ? (impData?.features ?? {}) : (perChainImp[impChain] ?? {});
+  const activeImpTrainRows = impChain === "all" ? (impData?.trainRows ?? 0) : Object.keys(activeImpFeatures).length > 0 ? (perChainImp[impChain] ? "per-chain" : 0) : 0;
+  const impChartData = Object.entries(activeImpFeatures)
+    .sort(([, a], [, b]) => (b as number) - (a as number))
     .map(([name, pct]) => ({
       name: name.replace(/_/g, " "),
-      importance: pct,
-      fill: pct >= 15 ? "#22c55e" : pct >= 8 ? "#3b82f6" : "#64748b",
+      importance: pct as number,
+      fill: (pct as number) >= 15 ? "#22c55e" : (pct as number) >= 8 ? "#3b82f6" : "#64748b",
     }));
 
   if (isLoading) {
@@ -309,6 +322,29 @@ export default function PerformancePage() {
                 {impData?.trainRows ? <span>Train: <span className="text-foreground">{impData.trainRows.toLocaleString()}</span> rows</span> : null}
                 {impData?.timestamp && <span>Updated: <span className="text-foreground">{new Date(impData.timestamp).toLocaleTimeString()}</span></span>}
               </div>
+            </div>
+            {/* Per-chain tabs */}
+            <div className="flex gap-1.5 mb-4 flex-wrap">
+              {IMP_CHAIN_TABS.map(({ key, label }) => {
+                const hasData = key === "all" || Object.keys(perChainImp[key] ?? {}).length > 0;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => hasData && setImpChain(key)}
+                    disabled={!hasData}
+                    className={cn(
+                      "px-3 py-1.5 rounded-lg text-xs font-medium transition-all",
+                      impChain === key
+                        ? "bg-primary/20 text-primary ring-1 ring-primary/30"
+                        : hasData
+                          ? "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                          : "bg-muted/20 text-muted-foreground/40 cursor-not-allowed"
+                    )}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
             </div>
             <div style={{ height: Math.max(180, impChartData.length * 32) }}>
               <ResponsiveContainer width="100%" height="100%">
