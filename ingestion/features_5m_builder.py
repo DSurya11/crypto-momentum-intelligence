@@ -124,10 +124,24 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             PARTITION BY token_address
                             ORDER BY bucket_timestamp
                         ) AS close_price_1h_ago,
+                        LAG(close_price, 3) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
+                        ) AS close_price_15m_ago,
+                        LAG(close_price, 6) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
+                        ) AS close_price_30m_ago,
                         LAG(close_price) OVER (
                             PARTITION BY token_address
                             ORDER BY bucket_timestamp
-                        ) AS prev_close_price
+                        ) AS prev_close_price,
+                        -- Rolling average volume as a robust proxy for rolling median (unsupported as window func in PG)
+                        AVG(total_volume) OVER (
+                            PARTITION BY token_address
+                            ORDER BY bucket_timestamp
+                            ROWS BETWEEN 12 PRECEDING AND 1 PRECEDING
+                        ) AS volume_avg_1h_rolling
                     FROM selected_metrics
                 ),
                 computed_base AS (
@@ -136,6 +150,7 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         bucket_timestamp,
                         buy_volume,
                         sell_volume,
+                        total_volume,
                         chain,
                         CASE
                             WHEN total_volume_avg_1h IS NULL OR total_volume_avg_1h = 0 THEN 0::DOUBLE PRECISION
@@ -145,6 +160,14 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             buy_volume::DOUBLE PRECISION / NULLIF(sell_volume::DOUBLE PRECISION, 0),
                             0::DOUBLE PRECISION
                         ) AS buy_sell_ratio,
+                        COALESCE(
+                            buy_volume::DOUBLE PRECISION / NULLIF(buy_volume::DOUBLE PRECISION + sell_volume::DOUBLE PRECISION, 0),
+                            0.5::DOUBLE PRECISION
+                        ) AS buy_pressure,
+                        CASE
+                            WHEN volume_avg_1h_rolling IS NULL OR volume_avg_1h_rolling = 0 THEN 0::DOUBLE PRECISION
+                            ELSE (total_volume::DOUBLE PRECISION / volume_avg_1h_rolling::DOUBLE PRECISION)
+                        END AS rvol_5m,
                         CASE
                             WHEN trade_count_avg_1h IS NULL OR trade_count_avg_1h = 0 THEN 0::DOUBLE PRECISION
                             ELSE (trade_count::DOUBLE PRECISION / trade_count_avg_1h)
@@ -155,12 +178,20 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             ELSE (close_price::DOUBLE PRECISION / close_price_1h_ago::DOUBLE PRECISION) - 1::DOUBLE PRECISION
                         END AS return_1h,
                         CASE
+                            WHEN close_price IS NULL OR close_price_15m_ago IS NULL OR close_price_15m_ago = 0 THEN 0::DOUBLE PRECISION
+                            ELSE (close_price::DOUBLE PRECISION / close_price_15m_ago::DOUBLE PRECISION) - 1::DOUBLE PRECISION
+                        END AS momentum_15m,
+                        CASE
+                            WHEN close_price IS NULL OR close_price_30m_ago IS NULL OR close_price_30m_ago = 0 THEN 0::DOUBLE PRECISION
+                            ELSE (close_price::DOUBLE PRECISION / close_price_30m_ago::DOUBLE PRECISION) - 1::DOUBLE PRECISION
+                        END AS momentum_30m,
+                        CASE
                             WHEN close_price IS NULL OR prev_close_price IS NULL OR prev_close_price = 0 THEN 0::DOUBLE PRECISION
                             ELSE (close_price::DOUBLE PRECISION / prev_close_price::DOUBLE PRECISION) - 1::DOUBLE PRECISION
                         END AS return_5m,
                         CASE
-                            WHEN total_volume_avg_30 IS NULL OR total_volume_avg_30 = 0 THEN 0::DOUBLE PRECISION
-                            ELSE (total_volume::DOUBLE PRECISION / total_volume_avg_30::DOUBLE PRECISION)
+                            WHEN volume_avg_1h_rolling IS NULL OR volume_avg_1h_rolling = 0 THEN 0::DOUBLE PRECISION
+                            ELSE (total_volume::DOUBLE PRECISION - volume_avg_1h_rolling::DOUBLE PRECISION) / volume_avg_1h_rolling::DOUBLE PRECISION
                         END AS volume_shock,
                         CASE
                             WHEN close_sma_12 IS NULL OR close_sma_26 IS NULL THEN 0::DOUBLE PRECISION
@@ -188,9 +219,14 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         chain,
                         volume_velocity,
                         buy_sell_ratio,
+                        buy_pressure,
+                        rvol_5m,
                         trade_intensity,
                         wallet_growth_delta,
                         return_1h,
+                        momentum_15m,
+                        momentum_30m,
+                        (momentum_15m - momentum_30m)::DOUBLE PRECISION AS momentum_accel,
                         return_5m,
                         volume_shock,
                         macd_proxy,
@@ -231,9 +267,48 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                             ELSE ((buy_volume - sell_volume)::DOUBLE PRECISION / (buy_volume + sell_volume)::DOUBLE PRECISION)
                         END AS order_flow_imbalance,
                         COALESCE(
+                            PERCENT_RANK() OVER (
+                                PARTITION BY bucket_timestamp, chain
+                                ORDER BY rvol_5m
+                            ),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS rvol_rank_pct,
+                        COALESCE(
+                            PERCENT_RANK() OVER (
+                                PARTITION BY bucket_timestamp, chain
+                                ORDER BY momentum_15m
+                            ),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS momentum_15m_rank_pct,
+                        COALESCE(
+                            PERCENT_RANK() OVER (
+                                PARTITION BY bucket_timestamp, chain
+                                ORDER BY momentum_30m
+                            ),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS momentum_30m_rank_pct,
+                        COALESCE(
+                            PERCENT_RANK() OVER (
+                                PARTITION BY bucket_timestamp, chain
+                                ORDER BY (momentum_15m - momentum_30m)
+                            ),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS momentum_accel_rank_pct,
+                        COALESCE(
+                            PERCENT_RANK() OVER (
+                                PARTITION BY bucket_timestamp, chain
+                                ORDER BY buy_pressure
+                            ),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS buy_pressure_rank_pct,
+                        COALESCE(
                             AVG(return_5m) OVER (PARTITION BY bucket_timestamp, chain),
                             0::DOUBLE PRECISION
                         )::DOUBLE PRECISION AS chain_avg_return_5m,
+                        COALESCE(
+                            AVG(momentum_30m) OVER (PARTITION BY chain, bucket_timestamp),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS chain_avg_momentum_30m,
                         AVG(gain_5m) OVER (
                             PARTITION BY token_address
                             ORDER BY bucket_timestamp
@@ -269,11 +344,28 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         r.bucket_timestamp,
                         r.volume_velocity,
                         r.buy_sell_ratio,
+                        r.buy_pressure,
+                        r.rvol_5m,
                         r.trade_intensity,
                         r.wallet_growth_delta,
                         r.return_1h,
+                        r.momentum_15m,
+                        r.momentum_30m,
+                        r.momentum_accel,
                         r.volume_accel,
-                        (r.return_5m - COALESCE(r.chain_avg_return_5m, 0))::DOUBLE PRECISION AS relative_momentum,
+                        r.rvol_rank_pct,
+                        r.momentum_15m_rank_pct,
+                        r.momentum_30m_rank_pct,
+                        r.momentum_accel_rank_pct,
+                        r.buy_pressure_rank_pct,
+                        (r.momentum_30m - COALESCE(r.chain_avg_momentum_30m, 0))::DOUBLE PRECISION AS relative_momentum,
+                        COALESCE(
+                            PERCENT_RANK() OVER (
+                                PARTITION BY r.bucket_timestamp, r.chain
+                                ORDER BY (r.momentum_30m - COALESCE(r.chain_avg_momentum_30m, 0))
+                            ),
+                            0::DOUBLE PRECISION
+                        )::DOUBLE PRECISION AS relative_momentum_rank_pct,
                         (r.return_5m - (r.return_1h / 12.0))::DOUBLE PRECISION AS momentum_acceleration,
                         r.volume_shock,
                         r.macd_proxy,
@@ -299,21 +391,34 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                         COALESCE(
                             EXTRACT(EPOCH FROM (r.bucket_timestamp - r.last_spike_ts)) / 60.0,
                             -1.0
-                        )::DOUBLE PRECISION AS minutes_since_last_spike
+                        )::DOUBLE PRECISION AS minutes_since_last_spike,
+                        LN(1.0 + GREATEST(EXTRACT(EPOCH FROM (r.bucket_timestamp - t.created_at)) / 3600.0, 0))::DOUBLE PRECISION AS time_since_launch_log
                     FROM computed_ranks r
                     LEFT JOIN regime_stats s ON r.bucket_timestamp = s.bucket_timestamp AND r.chain = s.chain
+                    LEFT JOIN tokens t ON r.token_address = t.token_address
                 )
                 INSERT INTO features_5m (
                     token_address,
                     bucket_timestamp,
                     volume_velocity,
                     buy_sell_ratio,
+                    buy_pressure,
+                    rvol_5m,
                     trade_intensity,
                     wallet_growth_delta,
                     return_1h,
+                    momentum_15m,
+                    momentum_30m,
+                    momentum_accel,
                     volume_accel,
                     relative_momentum,
                     momentum_acceleration,
+                    rvol_rank_pct,
+                    momentum_15m_rank_pct,
+                    momentum_30m_rank_pct,
+                    momentum_accel_rank_pct,
+                    buy_pressure_rank_pct,
+                    relative_momentum_rank_pct,
                     volume_shock,
                     macd_proxy,
                     rsi_14,
@@ -325,19 +430,31 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     hour_cos,
                     volume_relative_to_median,
                     order_flow_imbalance,
-                    minutes_since_last_spike
+                    minutes_since_last_spike,
+                    time_since_launch_log
                 )
                 SELECT
                     token_address,
                     bucket_timestamp,
                     volume_velocity,
                     buy_sell_ratio,
+                    buy_pressure,
+                    rvol_5m,
                     trade_intensity,
                     wallet_growth_delta,
                     return_1h,
+                    momentum_15m,
+                    momentum_30m,
+                    momentum_accel,
                     volume_accel,
                     relative_momentum,
                     momentum_acceleration,
+                    rvol_rank_pct,
+                    momentum_15m_rank_pct,
+                    momentum_30m_rank_pct,
+                    momentum_accel_rank_pct,
+                    buy_pressure_rank_pct,
+                    relative_momentum_rank_pct,
                     volume_shock,
                     macd_proxy,
                     rsi_14,
@@ -349,18 +466,30 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     hour_cos,
                     volume_relative_to_median,
                     order_flow_imbalance,
-                    minutes_since_last_spike
+                    minutes_since_last_spike,
+                    time_since_launch_log
                 FROM computed
                 ON CONFLICT (token_address, bucket_timestamp)
                 DO UPDATE SET
                     volume_velocity = EXCLUDED.volume_velocity,
                     buy_sell_ratio = EXCLUDED.buy_sell_ratio,
+                    buy_pressure = EXCLUDED.buy_pressure,
+                    rvol_5m = EXCLUDED.rvol_5m,
                     trade_intensity = EXCLUDED.trade_intensity,
                     wallet_growth_delta = EXCLUDED.wallet_growth_delta,
                     return_1h = EXCLUDED.return_1h,
+                    momentum_15m = EXCLUDED.momentum_15m,
+                    momentum_30m = EXCLUDED.momentum_30m,
+                    momentum_accel = EXCLUDED.momentum_accel,
                     volume_accel = EXCLUDED.volume_accel,
                     relative_momentum = EXCLUDED.relative_momentum,
                     momentum_acceleration = EXCLUDED.momentum_acceleration,
+                    rvol_rank_pct = EXCLUDED.rvol_rank_pct,
+                    momentum_15m_rank_pct = EXCLUDED.momentum_15m_rank_pct,
+                    momentum_30m_rank_pct = EXCLUDED.momentum_30m_rank_pct,
+                    momentum_accel_rank_pct = EXCLUDED.momentum_accel_rank_pct,
+                    buy_pressure_rank_pct = EXCLUDED.buy_pressure_rank_pct,
+                    relative_momentum_rank_pct = EXCLUDED.relative_momentum_rank_pct,
                     volume_shock = EXCLUDED.volume_shock,
                     macd_proxy = EXCLUDED.macd_proxy,
                     rsi_14 = EXCLUDED.rsi_14,
@@ -373,6 +502,7 @@ def build_features_5m(max_metric_rows: int) -> FeatureBuildStats:
                     volume_relative_to_median = EXCLUDED.volume_relative_to_median,
                     order_flow_imbalance = EXCLUDED.order_flow_imbalance,
                     minutes_since_last_spike = EXCLUDED.minutes_since_last_spike,
+                    time_since_launch_log = EXCLUDED.time_since_launch_log,
                     updated_at = NOW()
                 """,
                 (max_metric_rows,),

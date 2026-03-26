@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { DashboardLayout } from "@/components/DashboardLayout";
 import { StatCard } from "@/components/StatCard";
 import { backendApi } from "@/lib/api";
@@ -26,7 +27,16 @@ const REC_COLORS: Record<string, string> = {
   sell: "#ef4444",
 };
 
+const IMP_CHAIN_TABS = [
+  { key: "all", label: "All Chains" },
+  { key: "eth", label: "ETH" },
+  { key: "solana", label: "SOL" },
+  { key: "bsc", label: "BSC" },
+  { key: "base", label: "Base" },
+];
+
 export default function PerformancePage() {
+  const [impChain, setImpChain] = useState("all");
   const { data, isLoading } = useQuery({ queryKey: ["performance"], queryFn: () => backendApi.performance(200), refetchInterval: 15000 });
   const { data: impData } = useQuery({ queryKey: ["feature-importance"], queryFn: backendApi.featureImportance, refetchInterval: 30000 });
   const { data: threshData } = useQuery({ queryKey: ["thresholds"], queryFn: backendApi.thresholds, refetchInterval: 30000 });
@@ -52,13 +62,21 @@ export default function PerformancePage() {
     fill: REC_COLORS[rec] ?? "#64748b",
   }));
 
-  const impFeatures = impData?.features ?? {};
-  const impChartData = Object.entries(impFeatures)
-    .sort(([, a], [, b]) => b - a)
+  // Per-chain feature importance
+  const perChainImp = (impData as any)?.perChain ?? {};
+  const activeImpFeatures = impChain === "all" ? (impData?.features ?? {}) : (perChainImp[impChain] ?? {});
+  
+  // Per-chain thresholds
+  const perChainThresh = (threshData as any)?.perChain ?? {};
+  const activeThresh = impChain === "all" ? ((threshData as any)?.global ?? threshData) : (perChainThresh[impChain] ?? (threshData as any)?.global ?? threshData);
+
+  const activeImpTrainRows = impChain === "all" ? (impData?.trainRows ?? 0) : Object.keys(activeImpFeatures).length > 0 ? (perChainImp[impChain] ? "per-chain" : 0) : 0;
+  const impChartData = Object.entries(activeImpFeatures)
+    .sort(([, a], [, b]) => (b as number) - (a as number))
     .map(([name, pct]) => ({
       name: name.replace(/_/g, " "),
-      importance: pct,
-      fill: pct >= 15 ? "#22c55e" : pct >= 8 ? "#3b82f6" : "#64748b",
+      importance: pct as number,
+      fill: (pct as number) >= 15 ? "#22c55e" : (pct as number) >= 8 ? "#3b82f6" : "#64748b",
     }));
 
   if (isLoading) {
@@ -269,18 +287,41 @@ export default function PerformancePage() {
               Score Thresholds
             </h2>
             <div className="text-[11px] text-muted-foreground space-x-3">
-              {threshData?.calibrated
-                ? <span className="text-green-400">Auto-calibrated from {threshData.sampleSize.toLocaleString()} picks</span>
-                : <span className="text-yellow-400">Using defaults — need 150+ verified picks to calibrate</span>}
-              {threshData?.calibratedAt && <span>at {new Date(threshData.calibratedAt).toLocaleTimeString()}</span>}
+              {activeThresh?.calibrated
+                ? <span className="text-green-400">Auto-calibrated from {activeThresh?.sampleSize?.toLocaleString()} picks</span>
+                : <span className="text-yellow-400">Using defaults — need 100+ verified picks to calibrate</span>}
+              {activeThresh?.calibratedAt && <span>at {new Date(activeThresh.calibratedAt).toLocaleTimeString()}</span>}
             </div>
+          </div>
+          {/* Per-chain tabs */}
+          <div className="flex gap-1.5 mb-4 flex-wrap">
+            {IMP_CHAIN_TABS.map(({ key, label }) => {
+              const hasData = key === "all" || Object.keys(perChainThresh[key] ?? {}).length > 0 || Object.keys(perChainImp[key] ?? {}).length > 0;
+              return (
+                <button
+                  key={key}
+                  onClick={() => hasData && setImpChain(key)}
+                  disabled={!hasData}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-medium transition-all",
+                    impChain === key
+                      ? "bg-primary/20 text-primary ring-1 ring-primary/30"
+                      : hasData
+                        ? "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                        : "bg-muted/20 text-muted-foreground/40 cursor-not-allowed"
+                  )}
+                >
+                  {label}
+                </button>
+              );
+            })}
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             {[
-              { label: "Strong Buy", value: threshData?.strongBuy ?? 35, color: "text-green-400", bg: "bg-green-400/10", desc: "≥ this score" },
-              { label: "Buy",        value: threshData?.buy        ?? 27, color: "text-blue-400",  bg: "bg-blue-400/10",  desc: "≥ this score" },
-              { label: "Neutral",    value: threshData?.neutral    ?? 20, color: "text-slate-400", bg: "bg-slate-400/10", desc: "≥ this score" },
-              { label: "Sell",       value: threshData?.neutral    ?? 20, color: "text-red-400",   bg: "bg-red-400/10",   desc: "< neutral" },
+              { label: "Strong Buy", value: activeThresh?.strongBuy ?? 35, color: "text-green-400", bg: "bg-green-400/10", desc: "≥ this score" },
+              { label: "Buy",        value: activeThresh?.buy        ?? 27, color: "text-blue-400",  bg: "bg-blue-400/10",  desc: "≥ this score" },
+              { label: "Neutral",    value: activeThresh?.neutral    ?? 20, color: "text-slate-400", bg: "bg-slate-400/10", desc: "≥ this score" },
+              { label: "Sell",       value: activeThresh?.neutral    ?? 20, color: "text-red-400",   bg: "bg-red-400/10",   desc: "< neutral" },
             ].map(({ label, value, color, bg, desc }) => (
               <div key={label} className={`rounded-lg p-4 ${bg} flex flex-col gap-1`}>
                 <span className={`text-xs font-medium ${color}`}>{label}</span>

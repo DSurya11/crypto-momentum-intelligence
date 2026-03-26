@@ -76,26 +76,33 @@ _DEFAULT_THRESHOLDS: dict = {
 
 
 def load_thresholds() -> dict:
-    """Load calibrated thresholds from JSON; return defaults if file missing."""
     try:
         with open(_THRESHOLDS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # Validate required keys
-        if all(k in data for k in ("strong_buy", "buy", "neutral")):
+
+        if "global" in data:
             return data
+
+        if all(k in data for k in ("strong_buy", "buy", "neutral")):
+            return {
+                "global": data,
+                "perChain": {}
+            }
     except Exception:
         pass
-    return dict(_DEFAULT_THRESHOLDS)
+
+    return {
+        "global": dict(_DEFAULT_THRESHOLDS),
+        "perChain": {}
+    }
 
 
 def compute_adaptive_thresholds(conn: psycopg.Connection) -> dict:
-    """Calibrate score thresholds by analysing pick_outcomes win rates per bucket.
+    """Calibrate score thresholds by analysing pick_outcomes win rates.
 
     Algorithm:
-      1. Group all real (non-backfill) pick_outcomes by 0.05-wide score buckets.
-      2. Compute cumulative win rate from the top score bucket downward.
-         Win = price went up (effective_return > 0) — direction-neutral,
-         so we measure pure raw predictive power of high scores.
+      1. Fetch all recent pick_outcomes, ordered by model score DESC.
+      2. Compute cumulative win rate from the highest score downward.
       3. The threshold for each label is the LOWEST score at which the cumulative
          group (all picks scoring >= threshold) still meets the target win rate
          with enough samples.
@@ -107,132 +114,155 @@ def compute_adaptive_thresholds(conn: psycopg.Connection) -> dict:
       neutral    : cumulative win rate >= 44%  (need >= 15 picks)
       sell       : anything below neutral threshold
 
-    Falls back to hardcoded defaults when < 150 verified picks exist.
+    Calibrates on the last 14 days of data to stay adaptive to recent model drift.
     """
-    MIN_TOTAL      = 150    # minimum picks before calibrating
-    MIN_SB         = 30    # min picks in group for strong_buy threshold
-    MIN_BUY        = 20
-    MIN_NEUTRAL    = 15
+    MIN_TOTAL      = 100    # minimum picks before calibrating per chain / globally
+    MIN_SB         = 30     # min picks in group for strong_buy threshold
+    MIN_BUY        = 45
+    MIN_NEUTRAL    = 60
     TARGET_SB      = 0.58
     TARGET_BUY     = 0.52
     TARGET_NEUTRAL = 0.44
+    SCORE_FLOOR    = 0.15   # Don't let thresholds drift below 15% model score
 
     fallback = dict(_DEFAULT_THRESHOLDS)
+    result = {"global": fallback.copy(), "perChain": {}}
 
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                WITH norm AS (
-                    SELECT
-                        CASE
-                            WHEN model_score <= 1.0 THEN model_score
-                            ELSE model_score / 100.0
-                        END AS score_norm,
-                        recommendation,
-                        effective_return
-                    FROM pick_outcomes
-                    WHERE model_score IS NOT NULL
-                      AND effective_return IS NOT NULL
-                )
                 SELECT
-                    FLOOR(score_norm / 0.05) * 0.05 AS bucket_low,
-                    COUNT(*)                         AS n,
-                    SUM(
-                        CASE
-                            WHEN recommendation = 'sell'  AND effective_return <= 0 THEN 1
-                            WHEN recommendation != 'sell' AND effective_return >  0 THEN 1
-                            ELSE 0
-                        END
-                    ) AS wins
-                FROM norm
-                GROUP BY 1
-                ORDER BY 1 DESC
+                    COALESCE(LOWER(chain), 'base') as chain,
+                    CASE
+                        WHEN model_score <= 1.0 THEN model_score
+                        ELSE model_score / 100.0
+                    END AS score_norm,
+                    recommendation,
+                    effective_return
+                FROM pick_outcomes
+                WHERE model_score IS NOT NULL
+                  AND effective_return IS NOT NULL
+                  AND picked_at_utc >= NOW() - INTERVAL '14 days'
+                ORDER BY score_norm DESC
                 """
             )
             rows = cur.fetchall()
     except Exception as e:
         print(f"[THRESHOLDS] DB error: {e}")
-        return fallback
+        return result
 
-    total = sum(int(r[1]) for r in rows)
-    if total < MIN_TOTAL:
-        print(f"[THRESHOLDS] Only {total} verified picks — need {MIN_TOTAL} to calibrate, using defaults")
-        return fallback
+    if not rows:
+        print("[THRESHOLDS] No verified picks found in the last 14 days to calibrate.")
+        return result
 
-    cum_rows: list[tuple[float, int, float]] = []
-    cum_n = 0
-    cum_wins = 0
-    for bucket_low, n, wins in rows:
-        n_i = int(n)
-        wins_i = int(wins or 0)
-        cum_n += n_i
-        cum_wins += wins_i
-        cum_wr = (cum_wins / cum_n) if cum_n else 0.0
-        cum_rows.append((float(bucket_low), cum_n, cum_wr))
+    # Organize data for global and per-chain calibration
+    global_picks = []
+    chain_picks = {}
 
-    def _pick_threshold(target: float, min_n: int, default_value: float) -> float:
-        for score_low, n_i, wr_i in cum_rows:
-            if n_i >= min_n and wr_i >= target:
-                # cum_rows are ordered by score descending, so first match is
-                # the most selective threshold that still satisfies the target.
-                return score_low
+    for chain, score, rec, ret in rows:
+        # Define 'win' consistent with the prediction goal: 
+        # Price must go up for long-bias recommendations.
+        is_win = (ret > 0)
+        
+        pick = (float(score), bool(is_win))
+        global_picks.append(pick)
+        if chain not in chain_picks:
+            chain_picks[chain] = []
+        chain_picks[chain].append(pick)
 
-        # Guardrail: do not relax thresholds to very low values when target
-        # quality is not achieved. Keep stable defaults instead.
-        return default_value
+    def _calc_thresholds(picks: list[tuple[float, bool]]):
+        # picks is already sorted by score DESC from SQL
+        cum_rows = []
+        cum_n = 0
+        cum_wins = 0
+        for score, is_win in picks:
+            cum_n += 1
+            if is_win:
+                cum_wins += 1
+            cum_wr = cum_wins / cum_n
+            cum_rows.append((score, cum_n, cum_wr))
 
-    sb_thresh = _pick_threshold(TARGET_SB, MIN_SB, fallback["strong_buy"])
-    buy_thresh = _pick_threshold(TARGET_BUY, MIN_BUY, fallback["buy"])
-    neu_thresh = _pick_threshold(TARGET_NEUTRAL, MIN_NEUTRAL, fallback["neutral"])
+        def _pick_threshold(target: float, min_n: int, default_value: float) -> float:
+            # Scanning from highest score to lowest.
+            # We want the LOWEST score that still satisfies the target win rate
+            # with at least min_n samples.
+            last_valid = None
+            for score, n, wr in cum_rows:
+                if n >= min_n and wr >= target:
+                    last_valid = score
+                elif n >= min_n:
+                    # Once WR falls below target, we stop expanding
+                    break
+            
+            if last_valid is not None:
+                return max(last_valid, SCORE_FLOOR)
+            return default_value
 
-    # Sanity: enforce ordering
-    sb_thresh  = max(sb_thresh,  buy_thresh)
-    buy_thresh = max(buy_thresh, neu_thresh)
-    neu_thresh = min(max(neu_thresh, 0.0), 1.0)
+        sb_thresh  = _pick_threshold(TARGET_SB, MIN_SB, fallback["strong_buy"])
+        buy_thresh = _pick_threshold(TARGET_BUY, MIN_BUY, fallback["buy"])
+        neu_thresh = _pick_threshold(TARGET_NEUTRAL, MIN_NEUTRAL, fallback["neutral"])
 
-    sb_thresh = min(max(sb_thresh, buy_thresh), 1.0)
-    buy_thresh = min(max(buy_thresh, neu_thresh), 1.0)
+        # Sanity: enforce ordering strong_buy >= buy >= neutral
+        buy_thresh = max(buy_thresh, neu_thresh)
+        sb_thresh  = max(sb_thresh,  buy_thresh)
+        
+        # Ensure within 0-1 and above floor
+        sb_thresh  = min(max(sb_thresh,  SCORE_FLOOR), 1.0)
+        buy_thresh = min(max(buy_thresh, SCORE_FLOOR), 1.0)
+        neu_thresh = min(max(neu_thresh, SCORE_FLOOR), 1.0)
 
-    result = {
-        "strong_buy":    round(sb_thresh,  4),
-        "buy":           round(buy_thresh, 4),
-        "neutral":       round(neu_thresh, 4),
-        "calibrated":    True,
-        "sample_size":   total,
-        "calibrated_at": datetime.now(timezone.utc).isoformat(),
-    }
+        return {
+            "strong_buy":    round(sb_thresh,  4),
+            "buy":           round(buy_thresh, 4),
+            "neutral":       round(neu_thresh, 4),
+            "calibrated":    True,
+            "sample_size":   len(picks),
+            "calibrated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # Global
+    global_total = len(global_picks)
+    if global_total < MIN_TOTAL:
+        print(f"[THRESHOLDS] Only {global_total} verified picks in 14d — need {MIN_TOTAL} to calibrate global, using defaults")
+    else:
+        result["global"] = _calc_thresholds(global_picks)
+        print(f"[THRESHOLDS] Calibrated GLOBAL from {global_total} picks → "
+              f"strong_buy>={result['global']['strong_buy']:.3f}  buy>={result['global']['buy']:.3f}  neutral>={result['global']['neutral']:.3f}")
+
+    # Per-Chain
+    for chain, picks in chain_picks.items():
+        chain_total = len(picks)
+        if chain_total >= MIN_TOTAL:
+            result["perChain"][chain] = _calc_thresholds(picks)
+            print(f"[THRESHOLDS] Calibrated {chain.upper()} from {chain_total} picks → "
+                  f"strong_buy>={result['perChain'][chain]['strong_buy']:.3f}  buy>={result['perChain'][chain]['buy']:.3f}  neutral>={result['perChain'][chain]['neutral']:.3f}")
+        else:
+            print(f"[THRESHOLDS] {chain.upper()} has {chain_total} picks in 14d — need {MIN_TOTAL} to calibrate, using global")
 
     try:
         with open(_THRESHOLDS_PATH, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
-        print(
-            f"[THRESHOLDS] Calibrated from {total} picks → "
-            f"strong_buy>={sb_thresh:.2f}  buy>={buy_thresh:.2f}  neutral>={neu_thresh:.2f}"
-        )
     except Exception as e:
         print(f"[THRESHOLDS] Could not write {_THRESHOLDS_PATH}: {e}")
 
     return result
 
 
-def _rank_recommendations(scores: list[float]) -> list[str]:
-    """Assign recommendations from absolute model score using adaptive thresholds.
 
-    Thresholds are loaded from research/score_thresholds.json (written by
-    compute_adaptive_thresholds after each calibration cycle).  Falls back to
-    hardcoded defaults when the file doesn't exist yet.
-
-    In a weak session where all scores are low there may be zero strong_buy
-    picks — that is the correct honest behaviour.
-    """
+def _rank_recommendations(scores: list[float], chains: list[str]) -> list[str]:
+    """Assign recommendations from absolute model score using adaptive thresholds per chain."""
     t = load_thresholds()
-    STRONG_BUY = t["strong_buy"]
-    BUY        = t["buy"]
-    NEUTRAL    = t["neutral"]
 
     result: list[str] = []
-    for score in scores:
+    for score, chain in zip(scores, chains):
+        ch = str(chain).lower()
+        limits = t.get("perChain", {}).get(ch, t.get("global", _DEFAULT_THRESHOLDS))
+        
+        STRONG_BUY = limits.get("strong_buy", _DEFAULT_THRESHOLDS["strong_buy"])
+        BUY        = limits.get("buy", _DEFAULT_THRESHOLDS["buy"])
+        NEUTRAL    = limits.get("neutral", _DEFAULT_THRESHOLDS["neutral"])
+
         if score >= STRONG_BUY:
             result.append("strong_buy")
         elif score >= BUY:
@@ -423,7 +453,8 @@ def verify_and_store(
     # -----------------------------------------------------------------------
     for picked_at, candidates in cycle_candidates.items():
         scores = [c["score_raw"] for c in candidates]
-        recommendations = _rank_recommendations(scores)
+        chains = [c["chain"] for c in candidates]
+        recommendations = _rank_recommendations(scores, chains)
 
         for cand, recommendation in zip(candidates, recommendations):
             token = cand["token"]
@@ -530,8 +561,8 @@ def load_feedback_weights(
     token_addresses: list[str],
     bucket_timestamps: list,
     base_weight: float = 1.0,
-    win_boost: float = 1.5,
-    loss_boost: float = 4.5,
+    win_boost: float = 1.2,
+    loss_boost: float = 1.5,
 ) -> np.ndarray:
     """Compute per-sample training weights using feedback outcomes.
 
@@ -629,77 +660,86 @@ def load_feedback_weights(
 # ---------------------------------------------------------------------------
 
 def print_stats(conn: psycopg.Connection) -> None:
+    """Print detailed feedback statistics for the last 14 days."""
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM pick_outcomes")
-        total = cur.fetchone()[0]
+        # Time filter for consistency
+        SINCE_14D = "picked_at_utc >= NOW() - INTERVAL '14 days'"
 
-        cur.execute("SELECT COUNT(*) FROM pick_outcomes WHERE is_win = TRUE")
-        wins = cur.fetchone()[0]
+        cur.execute(f"SELECT COUNT(*), SUM(CASE WHEN is_win THEN 1 ELSE 0 END) FROM pick_outcomes WHERE {SINCE_14D}")
+        total, wins = cur.fetchone()
+        if not total:
+            print("[STATS] No verified picks found in the last 14 days.")
+            return
 
         cur.execute(
-            "SELECT recommendation, COUNT(*), "
-            "SUM(CASE WHEN is_win THEN 1 ELSE 0 END), "
-            "AVG(effective_return), "
-            "MIN(effective_return), MAX(effective_return) "
-            "FROM pick_outcomes GROUP BY recommendation ORDER BY recommendation"
+            f"SELECT recommendation, COUNT(*), "
+            f"SUM(CASE WHEN is_win THEN 1 ELSE 0 END), "
+            f"AVG(effective_return), "
+            f"MIN(effective_return), MAX(effective_return) "
+            f"FROM pick_outcomes WHERE {SINCE_14D} "
+            f"GROUP BY recommendation ORDER BY recommendation"
         )
         rec_rows = cur.fetchall()
 
         cur.execute(
-            "SELECT chain, COUNT(*), "
-            "SUM(CASE WHEN is_win THEN 1 ELSE 0 END), "
-            "AVG(effective_return) "
-            "FROM pick_outcomes GROUP BY chain ORDER BY chain"
+            f"SELECT chain, COUNT(*), "
+            f"SUM(CASE WHEN is_win THEN 1 ELSE 0 END), "
+            f"AVG(effective_return), "
+            f"MIN(effective_return), MAX(effective_return) "
+            f"FROM pick_outcomes WHERE {SINCE_14D} "
+            f"GROUP BY chain ORDER BY chain"
         )
         chain_rows = cur.fetchall()
 
-        # Score bucket analysis
         cur.execute(
-            """
+            f"""
             SELECT
-                CASE
-                    WHEN model_score >= 0.55 THEN 'strong_buy (>=55%)'
-                    WHEN model_score >= 0.45 THEN 'buy (45-55%)'
-                    WHEN model_score >= 0.35 THEN 'neutral (35-45%)'
-                    ELSE 'sell (<35%)'
-                END AS bucket,
+                FLOOR(
+                    (CASE WHEN model_score <= 1.0 THEN model_score ELSE model_score / 100.0 END) / 0.05
+                ) * 0.05 AS bucket_low,
                 COUNT(*),
                 SUM(CASE WHEN is_win THEN 1 ELSE 0 END),
                 AVG(return_2h),
                 AVG(effective_return)
             FROM pick_outcomes
-            GROUP BY bucket
-            ORDER BY bucket
+            WHERE model_score IS NOT NULL
+              AND effective_return IS NOT NULL
+              AND {SINCE_14D}
+            GROUP BY 1
+            ORDER BY 1 DESC
             """
         )
         bucket_rows = cur.fetchall()
 
     win_rate = (wins / total * 100) if total > 0 else 0
-    print(f"\n{'='*60}")
-    print(f"FEEDBACK LOOP STATISTICS")
-    print(f"{'='*60}")
+    print(f"\n{'='*75}")
+    print(f"FEEDBACK LOOP STATISTICS (Last 14 Days)")
+    print(f"{'='*75}")
     print(f"Total verified picks: {total}")
     print(f"Overall win rate:     {win_rate:.1f}%")
 
     print(f"\n--- By Recommendation ---")
-    print(f"{'Recommendation':<15} {'Total':>6} {'Wins':>6} {'WinRate':>8} {'AvgRet':>8} {'Best':>8} {'Worst':>8}")
+    print(f"{'Recommendation':<15} {'Total':>6} {'Wins':>6} {'WinRate':>8} {'AvgRet':>8} {'Worst':>8} {'Best':>8}")
     for rec, cnt, w, avg_ret, worst, best in rec_rows:
         wr = (w / cnt * 100) if cnt > 0 else 0
-        print(f"{rec:<15} {cnt:>6} {w:>6} {wr:>7.1f}% {avg_ret:>+7.2f}% {best:>+7.2f}% {worst:>+7.2f}%")
+        print(f"{rec:<15} {cnt:>6} {w:>6} {wr:>7.1f}% {avg_ret:>+7.2f}% {worst:>+7.2f}% {best:>+7.2f}%")
 
     print(f"\n--- By Chain ---")
-    print(f"{'Chain':<10} {'Total':>6} {'Wins':>6} {'WinRate':>8} {'AvgRet':>8}")
-    for chain, cnt, w, avg_ret in chain_rows:
+    print(f"{'Chain':<10} {'Total':>6} {'Wins':>6} {'WinRate':>8} {'AvgRet':>8} {'Worst':>8} {'Best':>8}")
+    for chain, cnt, w, avg_ret, worst, best in chain_rows:
         wr = (w / cnt * 100) if cnt > 0 else 0
-        print(f"{chain:<10} {cnt:>6} {w:>6} {wr:>7.1f}% {avg_ret:>+7.2f}%")
+        print(f"{chain:<10} {cnt:>6} {w:>6} {wr:>7.1f}% {avg_ret:>+7.2f}% {worst:>+7.2f}% {best:>+7.2f}%")
 
     print(f"\n--- By Score Bucket ---")
-    print(f"{'Bucket':<25} {'Total':>6} {'Wins':>6} {'WinRate':>8} {'RawRet':>8} {'EffRet':>8}")
-    for bucket, cnt, w, raw_ret, eff_ret in bucket_rows:
+    print(f"{'Bucket':<10} {'Total':>6} {'Wins':>6} {'WinRate':>8} {'RawRet':>8} {'EffRet':>8}")
+    for bkt_low, cnt, w, raw_ret, eff_ret in bucket_rows:
         wr = (w / cnt * 100) if cnt > 0 else 0
-        print(f"{bucket:<25} {cnt:>6} {w:>6} {wr:>7.1f}% {raw_ret:>+7.2f}% {eff_ret:>+7.2f}%")
+        label = f"{bkt_low:.2f}+"
+        print(f"{label:<10} {cnt:>6} {w:>6} {wr:>7.1f}% {raw_ret:>+7.2f}% {eff_ret:>+7.2f}%")
 
-    print(f"{'='*60}")
+    print(f"{'='*75}")
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +766,9 @@ def main() -> None:
         if args.verify:
             print(f"[FEEDBACK] Verifying picks from {args.snapshot_path}...")
             verify_and_store(conn, args.snapshot_path, args.min_age_minutes)
+            # Auto-recalibrate thresholds after every verify run
+            print(f"\n[FEEDBACK] Recalibrating thresholds...")
+            compute_adaptive_thresholds(conn)
 
         if args.stats:
             print_stats(conn)

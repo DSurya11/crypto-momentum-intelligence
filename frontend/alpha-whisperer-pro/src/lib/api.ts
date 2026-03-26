@@ -90,10 +90,14 @@ export const backendApi = {
     summary: { winRate: number; avgReturn2h: number; total: number };
     chainBreakdown?: Record<string, { total: number; wins: number; winRate: number; avgReturn: number; bestReturn: number; worstReturn: number }>;
     recBreakdown?: Record<string, { total: number; wins: number; winRate: number; avgReturn: number; bestReturn: number; worstReturn: number }>;
-  }>(`/api/performance?limit=${limit}&labels=strong_buy,buy,neutral,sell&verified_only=true`),
+  }>(`/api/performance?limit=${limit}&labels=strong_buy,buy,neutral,sell&verified_only=false`),
   settings: () => apiGet<{ env: Array<{ key: string; value: string; masked: boolean }> }>("/api/settings"),
   featureImportance: () => apiGet<{ features: Record<string, number>; timestamp: string | null; model: string | null; featureSet: string | null; trainRows: number; scoringRows: number }>("/api/feature-importance"),
-  thresholds: () => apiGet<{ strongBuy: number; buy: number; neutral: number; calibrated: boolean; sampleSize: number; calibratedAt: string | null }>("/api/thresholds"),
+  thresholds: () => apiGet<{ 
+    strongBuy: number; buy: number; neutral: number; calibrated: boolean; sampleSize: number; calibratedAt: string | null;
+    global: { strongBuy: number; buy: number; neutral: number; calibrated: boolean; sampleSize: number; calibratedAt: string | null };
+    perChain: Record<string, { strongBuy: number; buy: number; neutral: number; calibrated: boolean; sampleSize: number; calibratedAt: string | null }>;
+  }>("/api/thresholds"),
   runCycle: (payload: { tickCount: number; topN: number; marketApi: string }) => apiPost<{ ok: boolean; started?: boolean; alreadyRunning?: boolean; error?: string }>("/api/run-cycle", payload),
   cycleStatus: (sinceLine = 0) => apiGet<{ running: boolean; startedAt: string | null; finishedAt: string | null; ok: boolean | null; code: number | null; error: string | null; totalLines: number; newLines: string[] }>(`/api/cycle-status?since_line=${sinceLine}`),
   memeRadar: (refresh = false) => apiGet<MemeRadarResponse>(`/api/meme-radar${refresh ? "?refresh=true" : ""}`),

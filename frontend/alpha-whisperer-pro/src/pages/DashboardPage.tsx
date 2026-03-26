@@ -66,7 +66,16 @@ export default function DashboardPage() {
           <StatCard title="Total Picks" value={status.totalPicks} icon={<Activity className="h-5 w-5" />} />
           <StatCard title="Win Rate" value={status.winRate !== null ? `${status.winRate.toFixed(1)}%` : "—"} icon={<Trophy className="h-5 w-5" />} />
           <StatCard title="Top Confidence" value={picks[0]?.modelScore != null ? `${picks[0].modelScore.toFixed(1)}%` : "—"} icon={<Target className="h-5 w-5" />} subtitle="Model probability (base rate 21%)" />
-          <StatCard title="Last Run" value={status.lastRun ? new Date(status.lastRun).toLocaleTimeString() : "—"} icon={<Clock className="h-5 w-5" />} subtitle="Latest snapshot" />
+          <StatCard
+            title="Last Run"
+            value={
+              status.totalPicks > 0 && status.lastRun
+                ? new Date(status.lastRun).toLocaleTimeString()
+                : "—"
+            }
+            icon={<Clock className="h-5 w-5" />}
+            subtitle="Latest snapshot"
+          />
         </div>
 
         {/* Picks table */}

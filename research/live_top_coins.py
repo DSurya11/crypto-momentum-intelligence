@@ -32,6 +32,7 @@ from walkforward_evaluator_v2 import (
     stacking_oof_predictions,
     tune_xgboost,
 )
+from sklearn.isotonic import IsotonicRegression
 
 
 def get_env(name: str, default: str | None = None) -> str:
@@ -67,6 +68,33 @@ def latest_bucket(conn: psycopg.Connection) -> datetime:
         raise ValueError("No features_5m rows found")
     return row[0]
 
+def build_isotonic_calibrator(conn: psycopg.Connection) -> IsotonicRegression | None:
+    print("[CALIBRATION] Fetching 14-day history for Isotonic Regression...")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT model_score, (CASE WHEN effective_return > 0 THEN 1 ELSE 0 END) AS label
+                FROM pick_outcomes
+                WHERE picked_at_utc > NOW() - INTERVAL '14 days'
+                  AND recommendation IN ('buy', 'strong_buy')
+                  AND model_score IS NOT NULL
+            """)
+            rows = cur.fetchall()
+            
+        if len(rows) < 500:
+            print(f"[CALIBRATION] Insufficient history ({len(rows)}/500 needed) — skipping")
+            return None
+            
+        scores = np.array([float(r[0]) for r in rows])
+        labels = np.array([int(r[1]) for r in rows])
+        
+        calibrator = IsotonicRegression(out_of_bounds='clip')
+        calibrator.fit(scores, labels)
+        print(f"[CALIBRATION] Fitted IsotonicRegression on {len(rows)} outcomes")
+        return calibrator
+    except Exception as e:
+        print(f"[CALIBRATION] Warning: Isotonic calibration failed: {e}")
+        return None
 
 def load_training_data(conn: psycopg.Connection, feature_set: str, label_target: str, before_bucket: datetime):
     feature_names = FEATURE_SETS[feature_set]
@@ -288,8 +316,6 @@ def score_live(
         meta_sw = sample_weights[has_all] if sample_weights is not None else None
 
         meta = MetaLR(max_iter=1000, solver="lbfgs", random_state=42)
-        linear_bias = float(os.getenv("STACKING_LINEAR_BIAS", "0.35"))
-        linear_bias = min(max(linear_bias, 0.0), 0.8)
         if len(meta_x) < 20 or len(np.unique(meta_y)) < 2:
             # Fallback to weighted average if not enough OOF rows
             print("[STACKING] Insufficient OOF data — falling back to ensemble average")
@@ -337,16 +363,14 @@ def score_live(
                 rf_f.predict_proba(x_score_pp)[:, 1],
                 et_f.predict_proba(x_score_pp)[:, 1],
             ])
-            meta_prob = meta.predict_proba(base_score)[:, 1]
-            # Blend meta output with base logistic output to bias toward linear behavior.
-            prob = (1.0 - linear_bias) * meta_prob + linear_bias * base_score[:, 0]
+            prob = meta.predict_proba(base_score)[:, 1]
 
             # ── Feature importances: meta-weight × base-learner importance ──
             meta_w = np.abs(meta.coef_[0])  # [lr, xgb, rf, et]
             meta_w = meta_w / (meta_w.sum() or 1.0)
             print(
                 f"[STACKING] Meta-weights: LR={meta_w[0]:.3f} XGB={meta_w[1]:.3f} "
-                f"RF={meta_w[2]:.3f} ET={meta_w[3]:.3f} | linear_bias={linear_bias:.2f}"
+                f"RF={meta_w[2]:.3f} ET={meta_w[3]:.3f}"
             )
 
             lr_coefs = np.abs(lr_f.named_steps["clf"].coef_[0])
@@ -625,7 +649,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Live top-coins scorer from latest 5m bucket")
     parser.add_argument("--mode", choices=["pick", "verify"], default="pick")
     parser.add_argument("--model", choices=["logistic", "xgboost_tuned", "ensemble", "stacking"], default="stacking")
-    parser.add_argument("--feature-set", choices=["v2", "cross_rank", "base", "momentum_plus"], default="cross_rank")
+    parser.add_argument("--feature-set", choices=["v2", "cross_rank", "base", "momentum_plus"], default="momentum_plus")
     parser.add_argument("--label-target", choices=["adaptive", "fixed"], default="adaptive")
     parser.add_argument("--preprocessing", choices=["robust", "none"], default="robust")
     parser.add_argument("--top-n", type=int, default=50)
@@ -650,7 +674,7 @@ def main() -> None:
             conn, args.feature_set, args.label_target, before_bucket=bucket
         )
         # split training rows by chain
-        chain_map = {"eth": [], "sol": [], "bsc": [], "base": []}
+        chain_map = {"eth": [], "solana": [], "bsc": [], "base": []}
 
         with conn.cursor() as c:
             c.execute(
@@ -661,6 +685,8 @@ def main() -> None:
 
         for i, addr in enumerate(train_addrs):
             ch = addr_chain.get(addr, "base")
+            if ch == "sol":
+                ch = "solana"
             if ch not in chain_map:
                 ch = "base"
             chain_map[ch].append(i)
@@ -674,54 +700,7 @@ def main() -> None:
                 )
         meta, x_score, _ = load_scoring_rows(conn, args.feature_set, bucket)
 
-        # ── Momentum trigger gate before model prediction ──
-        # Skip weak/noisy rows so model only scores tokens with momentum context.
-        feat_idx = {name: i for i, name in enumerate(feature_names)}
-        min_volume_velocity = float(os.getenv("MOMENTUM_TRIGGER_MIN_VOLUME_VELOCITY", "2.0"))
-        min_buy_sell_ratio = float(os.getenv("MOMENTUM_TRIGGER_MIN_BUY_SELL_RATIO", "1.4"))
-        min_volume_shock = float(os.getenv("MOMENTUM_TRIGGER_MIN_VOLUME_SHOCK", "3.0"))
-        min_abs_relative_momentum = float(os.getenv("MOMENTUM_TRIGGER_MIN_ABS_REL_MOMENTUM", "0.02"))
-
-        def _f(row: np.ndarray, name: str, default: float = 0.0) -> float:
-            i = feat_idx.get(name)
-            if i is None:
-                return default
-            try:
-                return float(row[i])
-            except Exception:
-                return default
-
-        trigger_mask: list[bool] = []
-
-        for row in x_score:
-            volume_velocity = _f(row, "volume_velocity", 0.0)
-            buy_sell_ratio = _f(row, "buy_sell_ratio", 0.0)
-            volume_shock = _f(row, "volume_shock", volume_velocity)
-            relative_momentum = _f(row, "relative_momentum", _f(row, "return_1h", 0.0))
-
-            score = 0
-
-            if volume_velocity > min_volume_velocity:
-                score += 1
-
-            if buy_sell_ratio > min_buy_sell_ratio:
-                score += 1
-
-            if volume_shock > min_volume_shock:
-                score += 1
-
-            if abs(relative_momentum) > min_abs_relative_momentum:
-                score += 1
-
-            trigger_mask.append(score >= 2)
-
-        kept = int(sum(trigger_mask))
-        if kept > 0:
-            meta = [m for m, keep in zip(meta, trigger_mask) if keep]
-            x_score = x_score[np.asarray(trigger_mask, dtype=bool)]
-            print(f"[TRIGGER] Kept {kept}/{len(trigger_mask)} tokens for scoring")
-        else:
-            print("[TRIGGER] No rows passed momentum trigger, scoring full universe as fallback")
+        # ── Momentum trigger gate REMOVED (scoring all valid tokens natively) ──
 
         # ── Feedback loop: auto-verify old picks & compute sample weights ──
         sample_weights = None
@@ -749,24 +728,70 @@ def main() -> None:
         except Exception as err:
             print(f"[FEEDBACK] Warning: {err} — continuing without weights")
 
+        calibrator = build_isotonic_calibrator(conn)
+
         # train one model per chain
         chain_models = {}
+        importances_per_chain: dict[str, dict[str, float]] = {}
         importances = {}
         tuned = {}
+        probs = np.zeros(len(meta))
+        chain_thresholds = {}
+        
+        
         for ch, idx in chain_map.items():
-            if len(idx) < 50:
+            n_rows = len(idx)
+            if n_rows < 100:
+                print(f"[{ch}] Only {n_rows} rows — skipping, no model trained")
                 continue
 
             cx = x_train[idx]
             cy = y_train[idx]
+            sw = sample_weights[idx] if sample_weights is not None else None
 
-            if sample_weights is not None:
-                sw = sample_weights[idx]
-            else:
-                sw = None
+            curr_model = args.model
+            if n_rows < 400 and curr_model == "stacking":
+                curr_model = "logistic"
+                print(f"[{ch}] Only {n_rows} rows — using fallback simple setup")
 
+            # Calibrate threshold on validation split
+            split_idx = int(n_rows * 0.8)
+            cx_train, cx_val = cx[:split_idx], cx[split_idx:]
+            cy_train, cy_val = cy[:split_idx], cy[split_idx:]
+            sw_train = sw[:split_idx] if sw is not None else None
+
+            p_val, _, _ = score_live(
+                model_type=curr_model,
+                x_train=cx_train,
+                y_train=cy_train,
+                x_score=cx_val,
+                robust=(args.preprocessing == "robust"),
+                feature_names=feature_names,
+                sample_weights=sw_train,
+            )
+
+            if calibrator is not None:
+                p_val = calibrator.transform(p_val)
+
+            try:
+                from sklearn.metrics import precision_recall_curve
+                precision, recall, ths = precision_recall_curve(cy_val, p_val)
+                viable = np.where(precision[:-1] >= 0.65)[0]
+                if len(viable) > 0:
+                    optimal_threshold = ths[viable[0]]
+                else:
+                    opt_idx = np.argmax(2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-9))
+                    optimal_threshold = ths[opt_idx]
+            except Exception as e:
+                print(f"[{ch}] Threshold calibration error: {e}. Defaulting to 0.55")
+                optimal_threshold = 0.55
+            
+            chain_thresholds[ch] = float(optimal_threshold)
+            print(f"[{ch}] Calibrated threshold: {float(optimal_threshold):.4f}")
+
+            # Train on full block
             p, tuned_params, imp = score_live(
-                model_type=args.model,
+                model_type=curr_model,
                 x_train=cx,
                 y_train=cy,
                 x_score=x_score,
@@ -776,19 +801,32 @@ def main() -> None:
                 model_save_path=args.model_path,
             )
 
-            chain_models[ch] = p
+            if calibrator is not None:
+                p = calibrator.transform(p)
 
+            chain_models[ch] = p
             tuned = tuned_params
-            importances = imp
+            importances_per_chain[ch] = imp
+            importances = imp  # fallback: last chain for combined view
 
         # choose score based on token chain
-        probs = np.zeros(len(meta))
 
         for i, m in enumerate(meta):
             ch = (m.get("chain") or "base").lower()
+
+            # Ensure ch is string and correctly default if necessary
+            if not chain_models:
+                probs[i] = 0.0
+                continue
+                
             if ch not in chain_models:
                 ch = next(iter(chain_models))
-            probs[i] = chain_models[ch][i]
+
+            # Apply a heavy penalty if under threshold to prevent it from out-ranking true BUY signals
+            p_val = chain_models[ch][i]
+            if p_val < chain_thresholds.get(ch, 0.55):
+                p_val = p_val * 0.5
+            probs[i] = p_val
 
         ranked_idx = np.argsort(probs)[::-1]
         now_utc = datetime.now(timezone.utc).isoformat()
@@ -802,21 +840,27 @@ def main() -> None:
                     print(f"[ENRICH] Updated {enriched} token name(s) from CoinStats")
 
         # ── Tradability guardrails: reduce rug-prone picks before ranking output ──
-        MIN_VOLUME_5M = float(os.getenv("TRADABLE_MIN_VOLUME_5M", "10000"))
-        MIN_TOKEN_AGE_MINUTES = float(os.getenv("TRADABLE_MIN_TOKEN_AGE_MINUTES", "30"))
-        MIN_MARKET_CAP = float(os.getenv("TRADABLE_MIN_MARKET_CAP", "50000"))
+        # MIN_VOL_24H: minimum 24-hour USD volume ($20k default).
+        # We use CoinStats 24h volume when available; otherwise extrapolate
+        # from total_volume_5m × 288 (number of 5m buckets in 24 hours).
+        MIN_VOL_24H = float(os.getenv("TRADABLE_MIN_VOLUME_24H", os.getenv("TRADABLE_MIN_VOLUME_5M", "20000")))
+        MIN_TOKEN_AGE_MINUTES = float(os.getenv("TRADABLE_MIN_TOKEN_AGE_MINUTES", "60"))
+        MIN_MARKET_CAP = float(os.getenv("TRADABLE_MIN_MARKET_CAP", "200000"))
 
         def _token_age_minutes(m: dict) -> float:
-            born = m.get("token_created_at") or m.get("first_price_ts")
+            # Prefer first_price_ts (earliest price we've tracked) over
+            # token_created_at (DB insertion time, unreliable after resets).
+            born = m.get("first_price_ts") or m.get("token_created_at")
             if not born:
-                return 0.0
+                return float("inf")  # unknown age → assume old enough
             try:
                 dt = born
                 if getattr(dt, "tzinfo", None) is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-                return max((m["bucket_timestamp"] - dt).total_seconds() / 60.0, 0.0)
+                age = (m["bucket_timestamp"] - dt).total_seconds() / 60.0
+                return max(age, 0.0)
             except Exception:
-                return 0.0
+                return float("inf")  # on error, assume old enough
 
         tradable_idx: list[int] = []
         rejected_low_vol = 0
@@ -827,14 +871,22 @@ def main() -> None:
             addr = m["token_address"]
             mk = market_map.get(addr) or market_map.get(addr.lower(), {})
 
-            vol_5m = float(m.get("total_volume_5m") or 0.0)
+            # Prefer 24h volume from CoinStats; fall back to 5m bucket × 288
+            cs_vol_24h = mk.get("volume")
+            if cs_vol_24h is not None:
+                vol_24h = float(cs_vol_24h)
+            else:
+                vol_5m = float(m.get("total_volume_5m") or 0.0)
+                vol_24h = vol_5m * 288  # extrapolate to 24h
+
             age_min = _token_age_minutes(m)
             market_cap = mk.get("marketCap")
             if market_cap is None:
                 market_cap = mk.get("market_cap")
+            # If no market cap data, skip the check (don't penalise unlisted tokens)
             market_cap_ok = True if market_cap is None else float(market_cap) >= MIN_MARKET_CAP
 
-            if vol_5m < MIN_VOLUME_5M:
+            if vol_24h < MIN_VOL_24H:
                 rejected_low_vol += 1
                 continue
             if age_min < MIN_TOKEN_AGE_MINUTES:
@@ -848,16 +900,16 @@ def main() -> None:
         if rejected_low_vol or rejected_low_age or rejected_low_mcap:
             print(
                 "[TRADABILITY] filtered "
-                f"vol<{MIN_VOLUME_5M:.0f}: {rejected_low_vol}, "
+                f"vol24h<{MIN_VOL_24H:.0f}: {rejected_low_vol}, "
                 f"age<{MIN_TOKEN_AGE_MINUTES:.0f}m: {rejected_low_age}, "
                 f"mcap<{MIN_MARKET_CAP:.0f}: {rejected_low_mcap}"
             )
         if not tradable_idx:
-            print("[TRADABILITY] No tokens passed filters, falling back to unfiltered ranking")
-            tradable_idx = list(ranked_idx)
+            print("[TRADABILITY] No tokens passed filters — skipping this cycle")
+            return
 
         # ── Pump guard: cap already-pumped tokens to neutral (keep data, avoid buy signal) ──
-        PUMP_THRESHOLD = float(os.getenv("PUMP_FILTER_THRESHOLD", "30"))
+        PUMP_THRESHOLD = float(os.getenv("PUMP_FILTER_THRESHOLD", "25"))
         pumped_addrs: set[str] = set()
         if market_map and PUMP_THRESHOLD > 0:
             capped: list[str] = []
@@ -885,7 +937,7 @@ def main() -> None:
         limit = min(args.top_n, len(tradable_idx))
         for rank, idx in enumerate(tradable_idx[:limit], 1):
             m = meta[idx]
-            score = float(probs[idx]) * (1 + abs(x_score[idx][feat_idx["volume_shock"]]))
+            score = float(probs[idx]) 
             addr = m["token_address"]
 
             # Cap pumped tokens to neutral (score ≤ 0.35 → neutral, not buy/strong_buy)
@@ -927,8 +979,36 @@ def main() -> None:
         print("-" * 110)
         print(f"Saved snapshot: {args.snapshot_path}")
 
-        # ── Save feature importances JSON ──
-        importance_path = os.path.join(os.path.dirname(args.snapshot_path) or ".", "feature_importance.json")
+        # ── Save feature importances JSON (per-chain + combined) ──
+        imp_dir = os.path.dirname(args.snapshot_path) or "."
+
+        # Per-chain importance files
+        for ch, ch_imp in importances_per_chain.items():
+            ch_path = os.path.join(imp_dir, f"feature_importance_{ch}.json")
+            ch_payload = {
+                "timestamp": now_utc,
+                "model": args.model,
+                "chain": ch,
+                "featureSet": args.feature_set,
+                "trainRows": len(chain_map.get(ch, [])),
+                "scoringRows": int(x_score.shape[0]),
+                "features": ch_imp,
+            }
+            with open(ch_path, "w", encoding="utf-8") as fj:
+                json.dump(ch_payload, fj, indent=2)
+
+        # Combined importance (average across chains)
+        if importances_per_chain:
+            all_features = set()
+            for ch_imp in importances_per_chain.values():
+                all_features.update(ch_imp.keys())
+            combined = {}
+            for fn in all_features:
+                vals = [ch_imp.get(fn, 0.0) for ch_imp in importances_per_chain.values()]
+                combined[fn] = round(sum(vals) / len(vals), 2)
+            importances = combined
+
+        importance_path = os.path.join(imp_dir, "feature_importance.json")
         imp_payload = {
             "timestamp": now_utc,
             "model": args.model,
@@ -936,6 +1016,7 @@ def main() -> None:
             "trainRows": int(x_train.shape[0]),
             "scoringRows": int(x_score.shape[0]),
             "features": importances,
+            "perChain": {ch: imp for ch, imp in importances_per_chain.items()},
         }
         with open(importance_path, "w", encoding="utf-8") as fj:
             json.dump(imp_payload, fj, indent=2)

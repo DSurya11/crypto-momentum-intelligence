@@ -101,7 +101,7 @@ def main() -> None:
     parser.add_argument("--ingest-lookback-hours", type=int, default=24)
 
     parser.add_argument("--model", choices=["logistic", "xgboost_tuned", "ensemble", "stacking"], default="stacking")
-    parser.add_argument("--feature-set", choices=["v2", "cross_rank", "base"], default="v2")
+    parser.add_argument("--feature-set", choices=["v2", "cross_rank", "base", "momentum_plus"], default="momentum_plus")
     parser.add_argument("--label-target", choices=["adaptive", "fixed"], default="adaptive")
     parser.add_argument("--preprocessing", choices=["robust", "none"], default="robust")
     parser.add_argument("--top-n", type=int, default=50)
