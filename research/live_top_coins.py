@@ -81,8 +81,8 @@ def build_isotonic_calibrator(conn: psycopg.Connection) -> IsotonicRegression | 
             """)
             rows = cur.fetchall()
             
-        if len(rows) < 100:
-            print(f"[CALIBRATION] Insufficient history ({len(rows)}/100 needed) — skipping")
+        if len(rows) < 500:
+            print(f"[CALIBRATION] Insufficient history ({len(rows)}/500 needed) — skipping")
             return None
             
         scores = np.array([float(r[0]) for r in rows])
@@ -649,7 +649,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Live top-coins scorer from latest 5m bucket")
     parser.add_argument("--mode", choices=["pick", "verify"], default="pick")
     parser.add_argument("--model", choices=["logistic", "xgboost_tuned", "ensemble", "stacking"], default="stacking")
-    parser.add_argument("--feature-set", choices=["v2", "cross_rank", "base", "momentum_plus"], default="cross_rank")
+    parser.add_argument("--feature-set", choices=["v2", "cross_rank", "base", "momentum_plus"], default="momentum_plus")
     parser.add_argument("--label-target", choices=["adaptive", "fixed"], default="adaptive")
     parser.add_argument("--preprocessing", choices=["robust", "none"], default="robust")
     parser.add_argument("--top-n", type=int, default=50)
@@ -825,7 +825,7 @@ def main() -> None:
             # Apply a heavy penalty if under threshold to prevent it from out-ranking true BUY signals
             p_val = chain_models[ch][i]
             if p_val < chain_thresholds.get(ch, 0.55):
-                p_val = p_val * 0.1
+                p_val = p_val * 0.5
             probs[i] = p_val
 
         ranked_idx = np.argsort(probs)[::-1]

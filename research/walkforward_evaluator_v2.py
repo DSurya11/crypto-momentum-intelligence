@@ -49,7 +49,18 @@ MOMENTUM_PLUS_FEATURES = V2_FEATURES + [
     "volume_shock",
     "macd_proxy",
     "rsi_14",
-    "momentum_acceleration"
+    "momentum_acceleration",
+    "rvol_5m",
+    "momentum_15m",
+    "momentum_30m",
+    "momentum_accel",
+    "buy_pressure",
+    "rvol_rank_pct",
+    "momentum_15m_rank_pct",
+    "momentum_30m_rank_pct",
+    "momentum_accel_rank_pct",
+    "buy_pressure_rank_pct",
+    "relative_momentum_rank_pct"
 ]
 
 FEATURE_SETS = {
@@ -79,6 +90,7 @@ class Dataset:
     labels: np.ndarray
     regime_values: np.ndarray
     bucket_timestamps: np.ndarray
+    chains: np.ndarray
     feature_names: list[str]
 
 
@@ -109,11 +121,14 @@ def load_dataset(feature_set: str, label_target: str) -> Dataset:
             {feature_sql},
             {label_sql},
             f.market_momentum_regime::DOUBLE PRECISION,
-            f.bucket_timestamp
+            f.bucket_timestamp,
+            COALESCE(t.chain, 'base')
         FROM features_5m f
         INNER JOIN labels_5m l
-        ON f.token_address=l.token_address
-        AND f.bucket_timestamp=l.bucket_timestamp
+            ON f.token_address=l.token_address
+            AND f.bucket_timestamp=l.bucket_timestamp
+        INNER JOIN tokens t
+            ON f.token_address = t.token_address
         WHERE {label_sql} IN (0,1)
         ORDER BY f.bucket_timestamp ASC
     """
@@ -139,6 +154,7 @@ def load_dataset(feature_set: str, label_target: str) -> Dataset:
         labels=np.asarray([r[n_feat] for r in rows], dtype=np.int32),
         regime_values=np.asarray([r[n_feat+1] for r in rows], dtype=np.float64),
         bucket_timestamps=np.asarray([r[n_feat+2] for r in rows], dtype=object),
+        chains=np.asarray([r[n_feat+3] for r in rows], dtype=object),
         feature_names=feature_names,
     )
 
@@ -388,37 +404,54 @@ def main():
 
     total=len(dataset.labels)
 
-    x_train=dataset.features
-    y_train=dataset.labels
+    all_chains = np.unique(dataset.chains)
+    per_chain_results = {}
+    global_feat_imp = {}
 
-    model=make_xgboost(y_train)
-    model.fit(x_train,y_train)
+    for chain in all_chains:
+        idx = np.where(dataset.chains == chain)[0]
+        if len(idx) < 100:
+            print(f"Skipping {chain} - too few samples ({len(idx)})")
+            continue
+            
+        print(f"\n--- Training {chain.upper()} Model ({len(idx)} rows) ---")
+        x_c = dataset.features[idx]
+        y_c = dataset.labels[idx]
+        
+        # Simple XGBoost for importance/metrics reporting in this script
+        # Note: live_top_coins.py handles the full Stacking logic.
+        model = make_xgboost(y_c)
+        model.fit(x_c, y_c)
+        
+        prob = model.predict_proba(x_c)[:, 1]
+        auc = roc_auc_score(y_c, prob)
+        print(f"{chain.upper()} Training ROC-AUC: {auc:.4f}")
+        
+        imp = model.feature_importances_
+        feat_imp = {n: float(imp[i]) for i, n in enumerate(dataset.feature_names)}
+        
+        per_chain_results[chain] = {
+            "auc": float(auc),
+            "trainRows": int(len(idx)),
+            "features": feat_imp
+        }
+        
+        # Accumulate for global average
+        for n, v in feat_imp.items():
+            global_feat_imp[n] = global_feat_imp.get(n, 0.0) + v / len(all_chains)
 
-    prob=model.predict_proba(x_train)[:,1]
-
-    roc=roc_auc_score(y_train,prob)
-
-    print("ROC",roc)
-
-
-    feat_imp = {}
-
-    imp = model.feature_importances_
-
-    for i,n in enumerate(dataset.feature_names):
-        feat_imp[n] = float(imp[i])
-    out={
-        "timestamp":datetime.utcnow().isoformat(),
-        "model":args.model,
-        "featureSet":args.feature_set,
-        "trainRows":int(total),
-        "scoringRows":int(len(y_train)),
-        "features":feat_imp
+    out = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "model": args.model,
+        "featureSet": args.feature_set,
+        "trainRows": int(total),
+        "features": global_feat_imp,
+        "perChain": per_chain_results
     }
 
-
-    with open("research/feature_importance.json","w") as f:
-        json.dump(out,f,indent=2)
+    with open("research/feature_importance.json", "w") as f:
+        json.dump(out, f, indent=2)
+    print("\nSaved research/feature_importance.json")
 
 
 if __name__=="__main__":
