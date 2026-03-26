@@ -639,13 +639,14 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                         po.price_2h,
                         po.effective_return
                     FROM (
-                        SELECT * FROM pick_outcomes
+                        SELECT DISTINCT ON (token_address) *
+                        FROM pick_outcomes
                         WHERE {_time_filter}
-                        ORDER BY picked_at_utc DESC
-                        LIMIT %s
+                        ORDER BY token_address, picked_at_utc DESC
                     ) po
                     LEFT JOIN tokens t ON t.token_address = po.token_address
                     ORDER BY po.picked_at_utc DESC
+                    LIMIT %s
                     """,
                     (limit,),
                 )
@@ -820,7 +821,11 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                     f"""
                     SELECT
                         COUNT(*),
-                        SUM(CASE WHEN effective_return > 0 THEN 1 ELSE 0 END),
+                        SUM(CASE
+                            WHEN {_rec_sql} = 'sell'     AND effective_return <= 0 THEN 1
+                            WHEN {_rec_sql} != 'sell'    AND effective_return >  0 THEN 1
+                            ELSE 0
+                        END),
                         AVG(LEAST(GREATEST(effective_return, %s), %s))
                             FILTER (WHERE {_rec_sql} IN ('buy','strong_buy','neutral'))
                     FROM pick_outcomes
@@ -840,7 +845,11 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                     SELECT
                         chain,
                         COUNT(*) AS n,
-                        SUM(CASE WHEN effective_return > 0 THEN 1 ELSE 0 END) AS wins,
+                        SUM(CASE
+                            WHEN {_rec_sql} = 'sell'     AND effective_return <= 0 THEN 1
+                            WHEN {_rec_sql} != 'sell'    AND effective_return >  0 THEN 1
+                            ELSE 0
+                        END) AS wins,
                         AVG(LEAST(GREATEST(effective_return, %s), %s))
                             FILTER (WHERE {_rec_sql} IN ('buy','strong_buy','neutral')) AS avg_ret,
                         MAX(effective_return) FILTER (WHERE {_rec_sql} IN ('buy','strong_buy','neutral')) AS best,
@@ -871,7 +880,11 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                     SELECT
                         {_rec_sql} AS rec,
                         COUNT(*) AS n,
-                        SUM(CASE WHEN effective_return > 0 THEN 1 ELSE 0 END) AS wins,
+                        SUM(CASE
+                            WHEN {_rec_sql} = 'sell'     AND effective_return <= 0 THEN 1
+                            WHEN {_rec_sql} != 'sell'    AND effective_return >  0 THEN 1
+                            ELSE 0
+                        END) AS wins,
                         AVG(LEAST(GREATEST(effective_return, %s), %s)) AS avg_ret,
                         MAX(effective_return) AS best,
                         MIN(effective_return) AS worst

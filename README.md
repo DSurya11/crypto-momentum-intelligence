@@ -1,4 +1,4 @@
-﻿# Crypto Momentum Intelligence
+# Crypto Momentum Intelligence
 
 A live crypto trading intelligence system that ingests 5-minute OHLCV data from GeckoTerminal across Base, BSC, Solana and ETH chains, trains a stacking ensemble ML model every tick, and surfaces buy/sell/neutral recommendations through a React dashboard.
 
@@ -286,6 +286,12 @@ Tokens with **>30% price change in 24h** are capped to `neutral` to avoid chasin
 | `sell`       | Model predicts decline          |
 
 Only `buy` and `strong_buy` affect portfolio return metrics.
+
+---
+
+**Adaptive score calibration**
+
+Thresholds for `strong_buy`, `buy`, and `neutral` are continuously self-calibrated explicitly by the system using the trailing 14 days of verified predictions. The pipeline dynamically selects the optimal model score cutoffs per-chain that statistically meet specific win-rate target boundaries (e.g., ≥58% win rate for `strong_buy`). This automated feedback loop allows the model to naturally adapt its confidence strictness to the current market regime without manual intervention.
 
 ---
 

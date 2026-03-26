@@ -1,23 +1,23 @@
 {
-  "timestamp": "2026-03-25T18:55:10.776590+00:00",
+  "timestamp": "2026-03-26T05:50:18.326473+00:00",
   "model": "stacking",
   "chain": "solana",
   "featureSet": "v2",
-  "trainRows": 1621,
-  "scoringRows": 56,
+  "trainRows": 1638,
+  "scoringRows": 57,
   "features": {
-    "volume_velocity": 4.29,
-    "buy_sell_ratio": 3.49,
-    "trade_intensity": 0.75,
-    "wallet_growth_delta": 3.44,
-    "volume_velocity_rank_pct": 4.71,
-    "buy_sell_ratio_rank_pct": 5.54,
-    "trade_intensity_rank_pct": 3.68,
-    "volume_relative_to_median": 3.86,
-    "market_momentum_regime": 4.05,
+    "volume_velocity": 4.09,
+    "buy_sell_ratio": 3.35,
+    "trade_intensity": 0.67,
+    "wallet_growth_delta": 3.34,
+    "volume_velocity_rank_pct": 4.58,
+    "buy_sell_ratio_rank_pct": 5.7,
+    "trade_intensity_rank_pct": 3.59,
+    "volume_relative_to_median": 4.04,
+    "market_momentum_regime": 3.65,
     "order_flow_imbalance": 0.73,
-    "return_1h": 4.11,
-    "volume_accel": 5.17,
-    "time_since_launch_log": 5.43
+    "return_1h": 3.9,
+    "volume_accel": 5.35,
+    "time_since_launch_log": 5.69
   }
 }

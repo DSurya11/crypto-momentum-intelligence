@@ -561,8 +561,8 @@ def load_feedback_weights(
     token_addresses: list[str],
     bucket_timestamps: list,
     base_weight: float = 1.0,
-    win_boost: float = 1.5,
-    loss_boost: float = 4.5,
+    win_boost: float = 1.2,
+    loss_boost: float = 1.5,
 ) -> np.ndarray:
     """Compute per-sample training weights using feedback outcomes.
 

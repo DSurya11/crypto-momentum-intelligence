@@ -32,6 +32,7 @@ from walkforward_evaluator_v2 import (
     stacking_oof_predictions,
     tune_xgboost,
 )
+from sklearn.isotonic import IsotonicRegression
 
 
 def get_env(name: str, default: str | None = None) -> str:
@@ -67,6 +68,33 @@ def latest_bucket(conn: psycopg.Connection) -> datetime:
         raise ValueError("No features_5m rows found")
     return row[0]
 
+def build_isotonic_calibrator(conn: psycopg.Connection) -> IsotonicRegression | None:
+    print("[CALIBRATION] Fetching 14-day history for Isotonic Regression...")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT model_score, (CASE WHEN effective_return > 0 THEN 1 ELSE 0 END) AS label
+                FROM pick_outcomes
+                WHERE picked_at_utc > NOW() - INTERVAL '14 days'
+                  AND recommendation IN ('buy', 'strong_buy')
+                  AND model_score IS NOT NULL
+            """)
+            rows = cur.fetchall()
+            
+        if len(rows) < 100:
+            print(f"[CALIBRATION] Insufficient history ({len(rows)}/100 needed) — skipping")
+            return None
+            
+        scores = np.array([float(r[0]) for r in rows])
+        labels = np.array([int(r[1]) for r in rows])
+        
+        calibrator = IsotonicRegression(out_of_bounds='clip')
+        calibrator.fit(scores, labels)
+        print(f"[CALIBRATION] Fitted IsotonicRegression on {len(rows)} outcomes")
+        return calibrator
+    except Exception as e:
+        print(f"[CALIBRATION] Warning: Isotonic calibration failed: {e}")
+        return None
 
 def load_training_data(conn: psycopg.Connection, feature_set: str, label_target: str, before_bucket: datetime):
     feature_names = FEATURE_SETS[feature_set]
@@ -700,6 +728,8 @@ def main() -> None:
         except Exception as err:
             print(f"[FEEDBACK] Warning: {err} — continuing without weights")
 
+        calibrator = build_isotonic_calibrator(conn)
+
         # train one model per chain
         chain_models = {}
         importances_per_chain: dict[str, dict[str, float]] = {}
@@ -740,6 +770,9 @@ def main() -> None:
                 sample_weights=sw_train,
             )
 
+            if calibrator is not None:
+                p_val = calibrator.transform(p_val)
+
             try:
                 from sklearn.metrics import precision_recall_curve
                 precision, recall, ths = precision_recall_curve(cy_val, p_val)
@@ -767,6 +800,9 @@ def main() -> None:
                 sample_weights=sw,
                 model_save_path=args.model_path,
             )
+
+            if calibrator is not None:
+                p = calibrator.transform(p)
 
             chain_models[ch] = p
             tuned = tuned_params

@@ -4,8 +4,8 @@
     "buy": 0.27,
     "neutral": 0.2,
     "calibrated": true,
-    "sample_size": 1102,
-    "calibrated_at": "2026-03-25T18:53:41.896081+00:00"
+    "sample_size": 1374,
+    "calibrated_at": "2026-03-26T05:49:19.100592+00:00"
   },
   "perChain": {
     "eth": {
@@ -13,32 +13,32 @@
       "buy": 0.27,
       "neutral": 0.15,
       "calibrated": true,
-      "sample_size": 250,
-      "calibrated_at": "2026-03-25T18:53:41.896081+00:00"
+      "sample_size": 314,
+      "calibrated_at": "2026-03-26T05:49:19.100592+00:00"
     },
     "bsc": {
       "strong_buy": 0.35,
       "buy": 0.27,
       "neutral": 0.2,
       "calibrated": true,
-      "sample_size": 266,
-      "calibrated_at": "2026-03-25T18:53:41.897063+00:00"
+      "sample_size": 334,
+      "calibrated_at": "2026-03-26T05:49:19.100592+00:00"
     },
     "solana": {
       "strong_buy": 0.35,
-      "buy": 0.2267,
+      "buy": 0.295,
       "neutral": 0.15,
       "calibrated": true,
-      "sample_size": 328,
-      "calibrated_at": "2026-03-25T18:53:41.897063+00:00"
+      "sample_size": 413,
+      "calibrated_at": "2026-03-26T05:49:19.102102+00:00"
     },
     "base": {
       "strong_buy": 0.35,
       "buy": 0.27,
       "neutral": 0.2,
       "calibrated": true,
-      "sample_size": 258,
-      "calibrated_at": "2026-03-25T18:53:41.897063+00:00"
+      "sample_size": 313,
+      "calibrated_at": "2026-03-26T05:49:19.102102+00:00"
     }
   }
 }
