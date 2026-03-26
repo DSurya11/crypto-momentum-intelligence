@@ -283,7 +283,7 @@ export default function MemeRadarPage() {
         <div className="flex flex-col items-center justify-center py-20 gap-3">
           <RefreshCw className="h-8 w-8 text-primary animate-spin" />
           <p className="text-sm text-muted-foreground">Scanning Reddit, X & CoinStats…</p>
-          <p className="text-xs text-muted-foreground">This takes ~30–60 seconds on first load</p>
+          <p className="text-xs text-muted-foreground">This takes ~5-10 minutes on first load</p>
         </div>
       )}
 

@@ -1,4 +1,4 @@
-# Crypto Momentum Intelligence
+﻿# Crypto Momentum Intelligence
 
 A live crypto trading intelligence system that ingests 5-minute OHLCV data from GeckoTerminal across Base, BSC, Solana and ETH chains, trains a stacking ensemble ML model every tick, and surfaces buy/sell/neutral recommendations through a React dashboard.
 
@@ -8,7 +8,7 @@ A live crypto trading intelligence system that ingests 5-minute OHLCV data from 
 
 1. **Ingests** raw swap data from GeckoTerminal every 5 minutes across four chains
 2. **Builds** 5-minute OHLCV price candles, token metrics, feature signals, and forward-return labels
-3. **Trains** a stacking ensemble (XGBoost + Random Forest + Extra Trees + Logistic Regression meta-learner) on all labeled data using feedback-based sample weighting from past prediction outcomes
+3. **Trains** isolated, per-chain stacking ensemble models (XGBoost + Random Forest + Extra Trees + Logistic Regression meta-learner) on all labeled data using feedback-based sample weighting from past prediction outcomes
 4. **Scores** tokens and selects the top-N by model probability each tick
 5. **Logs** picks and verifies them after two hours, recording win/loss and effective return in `pick_outcomes`
 6. **Enriches** token names from CoinStats after each cycle to replace temporary `TKN_` placeholders with real symbols
@@ -224,7 +224,7 @@ React Dashboard
 
 **Architecture**
 
-Stacking ensemble:
+Per-chain Stacking ensemble (separate models for BASE, BSC, SOL, ETH):
 
 - XGBoost
 - Random Forest
@@ -236,7 +236,7 @@ Stacking ensemble:
 **Feature sets**
 
 - `v2`
-- `cross_rank`
+- `cross_rank` (percentile rankings like `rvol_rank_pct`)
 - `base`
 
 ---
@@ -253,9 +253,9 @@ Top 20% tokens by forward return per 5-minute bucket.
 
 **Training**
 
-- Retrained every pipeline tick
+- Models are trained independently per chain every pipeline tick
 - Uses rows with closed 2-hour label windows
-- Typical dataset size: **17k–30k rows**
+- Typical dataset size: **12k–30k rows**
 
 ---
 
@@ -307,6 +307,37 @@ Thresholds for `strong_buy`, `buy`, and `neutral` are continuously self-calibrat
 | Settings     | `/settings`    | Configuration panel  |
 
 ---
+\
+## Screenshots
+
+*(Note: Save your screenshots to an `assets/` folder in the root directory to display them here)*
+
+### Dashboard Overview
+![Dashboard](assets/dashboard.png)
+
+### Live Momentum Picks
+![Live Picks](assets/live_picks.png)
+
+### Meme Radar
+![Meme Radar](assets/meme_radar.png)
+
+### Performance Overview
+![Performance](assets/performance.png)
+
+### Pending Predictions
+![Pending Predictions](assets/performance_pending.png)
+
+### Verified Prediction Outcomes
+![Prediction Outcomes](assets/performance_outcomes.png)
+
+### Win Rate & Cumulative Return
+![Cumulative Return](assets/cumulative_return.png)
+
+### Model Auto-Calibration & Thresholds (BSC)
+![BSC Thresholds](assets/bsc_thresholds.png)
+
+### Feature Importance Tracking
+![Feature Importance](assets/feature_importance.png)
 
 ## Performance metrics explained
 

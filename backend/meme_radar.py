@@ -43,19 +43,63 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MEME_SUBREDDITS = [
-    "CryptoCurrency",
-    "CryptoMoonShots",
-    "SatoshiStreetBets",
-    "memes",
-    "wallstreetbets",
+    # ── CORE MEME HUBS ────────────────────────────────────────────────────
+    "memes",              # 50M+ members, benchmark for mainstream viral content
+    "dankmemes",          # Faster-moving than r/memes, breaks trends earlier
+    "MemeEconomy",        # Explicitly tracks rising vs dying meme formats
+    "AdviceAnimals",      # Classic image macros, animal memes often become coins
+    "funny",              # Broad humor, catches crossover memes
+
+    # ── EARLY DETECTION (memes born here before going mainstream) ─────────
+    "OutOfTheLoop",       # "What is X?" posts = meme breaking RIGHT NOW before peak
+    "ComedyHeaven",       # Surreal/absurdist memes, PEPE-type coins originate here
+    "okbuddyretard",      # Deep irony memes, 4chan overflow, early niche coin signal
+    "196",                # Gen Z absurdist hub, extremely fast meme cycle
+    "me_irl",             # Relatable memes, large Gen Z base, fast-moving
+    "2meirl4meirl",       # Offshoot of me_irl, catches emotional viral spikes
+
+    # ── POP CULTURE (TV/film/music events spawn meme coins overnight) ─────
+    "entertainment",      # Broad pop culture events
+    "movies",             # Film release memes, movie character coins get launched
+    "television",         # Show finales/premieres create instant meme spikes
+    "popculturechat",     # Celebrity moments go viral here first
+    "Unexpected",         # Viral surprise clips become memes fast
+    "HolUp",              # Reaction memes to absurd news/clips
+
+    # ── ANIMAL MEMES (direct lineage: DOGE, SHIB, BONK, WIF, CAT) ────────
+    "rarepuppers",        # Dog memes — direct DOGE/SHIB/BONK signal
+    "IllegallySmolCats",  # Cat memes — CAT/NYAN coin territory
+    "AnimalsBeingDerps",  # Cross-species viral animal content
+    "Zoomies",            # High-energy animal clips going viral
+
+    # ── YOUTH/GEN Z CULTURE (fastest meme-to-coin pipeline) ──────────────
+    "teenagers",          # Gen Z trends start here before TikTok
+    "TikTokCringe",       # TikTok memes spill to Reddit here, 24-48hr early signal
+    "youngpeopleyoutube", # Youth reaction culture
+    "GenZ",               # Self-aware Gen Z meme discussion
+
+    # ── VIRAL/TRENDING CONTENT (cross-platform spillover) ────────────────
+    "interestingasfuck",  # Viral non-meme content that BECOMES memes
+    "instant_regret",     # High-engagement reaction content
+    "therewasanattempt",  # Failure memes, surprisingly strong coin association
+    "Whatcouldgowrong",   # Failure/reaction meme pool
+    "HumansBeingBros",    # Wholesome viral, spawns positivity-themed coins
+
+    # ── INTERNET CULTURE META ─────────────────────────────────────────────
+    "knowyourmeme",       # If it's here it's confirmed viral — lagging but strong signal
+    "DeepFriedMemes",     # Heavily processed/ironic memes, Gen Z coin culture
+    "surrealmemes",       # Abstract memes, many abstract coins trace back here
 ]
 
 # X/Twitter search queries — crypto-meme-focused
 X_SEARCH_QUERIES = [
-    "crypto meme coin -is:retweet has:media lang:en",
-    "memecoin OR meme coin -is:retweet lang:en",
-    "$PEPE OR $DOGE OR $SHIB OR $BONK OR $WIF meme -is:retweet lang:en",
-    "new meme token launch -is:retweet lang:en",
+    "meme trending -is:retweet lang:en min_faves:500",
+    "new meme format -is:retweet has:media lang:en",
+    "this meme -is:retweet lang:en min_faves:1000",
+    "everyone is talking about -is:retweet lang:en min_faves:300",
+    "viral right now -is:retweet has:media lang:en",
+    "what is this meme -is:retweet lang:en",
+    "meme coin named after -is:retweet lang:en",
 ]
 
 # Keywords to skip — common English words that produce garbage coin matches.
@@ -111,7 +155,7 @@ SKIP_KEYWORDS = frozenset({
     "life", "end", "head", "side", "fact", "line", "face", "eye", "body",
     "man", "men", "woman", "women", "child", "kid", "kids", "girl",
     "boy", "guy", "guys", "friend", "friends", "family", "father",
-    "mother", "brother", "sister", "baby", "son", "wife", "husband",
+    "mother", "brother", "sister", "son", "wife", "husband",
     "car", "water", "food", "house", "door", "room", "job", "game",
     "team", "school", "company", "group", "lot", "kind", "name",
     "number", "story", "question", "answer", "idea", "word", "words",
@@ -134,12 +178,12 @@ SKIP_KEYWORDS = frozenset({
     "buy", "sell", "price", "market", "trading", "trade", "trades",
     "money", "investment", "invest", "investor", "stock", "stocks",
     "share", "shares", "profit", "loss", "gains", "gain", "pump",
-    "dump", "moon", "hodl", "bear", "bull", "bullish", "bearish",
+    "dump", "hodl", "bear", "bull", "bullish", "bearish",
     "wallet", "exchange", "mining", "miner", "blockchain", "defi",
     "nft", "nfts", "dao", "yield", "stake", "staking", "airdrop",
     "chart", "candle", "volume", "cap", "supply", "burn", "mint",
     "rug", "scam", "whale", "whales", "dip", "ath", "fomo", "fud",
-    "diamond", "hands", "ape", "apes", "rocket", "lambo",
+    "lambo",
     "tendies", "yolo", "wsb", "gme", "squeeze", "short", "retard",
     "autist", "puts", "calls", "options", "futures", "leverage",
 })
@@ -820,25 +864,32 @@ def run_meme_radar(
 
     # Cap at max_results (not a multiple) — avoids spawning 60+ API calls
     candidates = deduplicated[:max_results]
-
-    def _coin_candidates(keywords: list[str], n: int = 5) -> list[str]:
+    def _coin_candidates(post: MemePost, n: int = 5) -> list[str]:
         """Pick the best keywords for CoinStats exact-match search.
 
-        extract_keywords() returns long phrases first, but CoinStats matching
-        works best on single-word names and short multi-word coin names.
-        Order: singles (in title order — so "bitcoin" before "breaks") →
-               2-word phrases → 3-word phrases.
-        Long phrases (4+ words) are excluded — too unlikely to equal a coin name.
+        Priority:
+          1. Capitalized single words in ORIGINAL title
+          2. 2-word phrases
+          3. Lowercase single words
+          4. 3-word phrases
         """
-        singles = [k for k in keywords if " " not in k]          # preserve title order
+        original_words = re.sub(r"[^a-zA-Z0-9\s$#]", " ", post.title).split()
+        capitalized = {w.lower() for w in original_words if w and w[0].isupper()}
+        
+        keywords = post.keywords
+        singles = [k for k in keywords if " " not in k]
         two_word = [k for k in keywords if k.count(" ") == 1]
         three_word = [k for k in keywords if k.count(" ") == 2]
-        return (singles + two_word + three_word)[:n]
+        
+        cap_singles = [k for k in singles if k in capitalized]
+        low_singles = [k for k in singles if k not in capitalized]
+        
+        return (cap_singles + two_word + low_singles + three_word)[:n]
 
     coin_results: dict[int, list] = {}
     if search_coins:
         for i, post in enumerate(candidates):
-            search_kw = _coin_candidates(post.keywords, n=5)
+            search_kw = _coin_candidates(post, n=5)
             try:
                 coins = find_exact_coin_matches(search_kw, max_searches=5)
             except Exception:
@@ -894,6 +945,7 @@ def run_meme_radar(
             "growthPhase": post.growth_phase,
             "keywords": post.keywords[:8],
             "crossSubCount": cross_count,
+            "memeTheme": matched_coins[0]["matchKeyword"] if matched_coins else "",
             "relatedCoins": matched_coins,
             "thumbnail": post.thumbnail if post.thumbnail.startswith("http") else "",
         })
