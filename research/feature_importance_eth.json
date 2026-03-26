@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-03-25T18:55:10.776590+00:00",
+  "model": "stacking",
+  "chain": "eth",
+  "featureSet": "v2",
+  "trainRows": 1875,
+  "scoringRows": 56,
+  "features": {
+    "volume_velocity": 4.35,
+    "buy_sell_ratio": 1.41,
+    "trade_intensity": 4.92,
+    "wallet_growth_delta": 2.22,
+    "volume_velocity_rank_pct": 4.63,
+    "buy_sell_ratio_rank_pct": 4.77,
+    "trade_intensity_rank_pct": 1.87,
+    "volume_relative_to_median": 6.18,
+    "market_momentum_regime": 6.12,
+    "order_flow_imbalance": 1.33,
+    "return_1h": 6.33,
+    "volume_accel": 4.87,
+    "time_since_launch_log": 4.44
+  }
+}

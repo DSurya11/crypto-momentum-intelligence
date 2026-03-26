@@ -148,63 +148,97 @@ def _conn() -> psycopg.Connection:
 _DEFAULT_THRESHOLDS = {"strong_buy": 35.0, "buy": 27.0, "neutral": 20.0}
 
 
-def _load_thresholds() -> dict:
-    """Load calibrated score thresholds from research/score_thresholds.json.
-
-    Values in the JSON are stored as 0-1 floats (feedback_loop scale).
-    This function returns them multiplied by 100 to match score_pcts scale
-    used throughout api.py.  Falls back to hardcoded defaults.
+def _load_thresholds() -> dict[str, Any]:
+    """Load adaptive thresholds from JSON file.
+    
+    The file now has a nested structure:
+    {
+      "global": { "strong_buy": 0.35, "buy": 0.3, ... },
+      "perChain": { "solana": { ... }, "base": { ... } }
+    }
+    
+    If it's the old flat format, it will migrate it into the "global" key.
+    This function returns them multiplied by 100 to match score_pcts scale.
+    Falls back to hardcoded defaults.
     """
+    default_global = {
+        "strong_buy": _DEFAULT_THRESHOLDS["strong_buy"] * 100.0,
+        "buy":        _DEFAULT_THRESHOLDS["buy"]        * 100.0,
+        "neutral":    _DEFAULT_THRESHOLDS["neutral"]    * 100.0,
+    }
+    result = {"global": default_global, "perChain": {}}
+
     try:
         with open(THRESHOLDS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if all(k in data for k in ("strong_buy", "buy", "neutral")):
-            return {
+            
+        if "global" in data:
+            # New nested format
+            g = data["global"]
+            result["global"] = {
+                "strong_buy": float(g["strong_buy"]) * 100.0,
+                "buy":        float(g["buy"])        * 100.0,
+                "neutral":    float(g["neutral"])    * 100.0,
+                "calibrated": g.get("calibrated", False),
+                "sampleSize": g.get("sample_size", 0),
+                "calibratedAt": g.get("calibrated_at"),
+            }
+            if "perChain" in data:
+                for ch, cdata in data["perChain"].items():
+                    result["perChain"][ch] = {
+                        "strong_buy": float(cdata["strong_buy"]) * 100.0,
+                        "buy":        float(cdata["buy"])        * 100.0,
+                        "neutral":    float(cdata["neutral"])    * 100.0,
+                        "calibrated": cdata.get("calibrated", False),
+                        "sampleSize": cdata.get("sample_size", 0),
+                        "calibratedAt": cdata.get("calibrated_at"),
+                    }
+        elif all(k in data for k in ("strong_buy", "buy", "neutral")):
+            # Old flat format
+            result["global"] = {
                 "strong_buy": float(data["strong_buy"]) * 100.0,
                 "buy":        float(data["buy"])        * 100.0,
                 "neutral":    float(data["neutral"])    * 100.0,
+                "calibrated": data.get("calibrated", False),
+                "sampleSize": data.get("sample_size", 0),
+                "calibratedAt": data.get("calibrated_at"),
             }
     except Exception:
         pass
-    return dict(_DEFAULT_THRESHOLDS)
+        
+    return result
 
 
-def _recommendations_from_scores(score_pcts: list[float]) -> list[str]:
-    """Assign recommendations purely from absolute model score (score_pcts 0–100).
-
-    Thresholds are loaded from research/score_thresholds.json, auto-calibrated
-    each cycle by compute_adaptive_thresholds() in feedback_loop.py based on
-    real win rates per score bucket.  Falls back to hardcoded defaults.
-
-    In a weak session where all scores are low there may be zero strong_buy
-    picks — that is the correct honest behaviour.
-    """
+def _recommendations_from_scores(score_pcts: list[float], chains: list[str]) -> list[str]:
+    """Assign recommendations purely from absolute model score (score_pcts 0–100) per chain."""
     t = _load_thresholds()
-    STRONG_BUY = t["strong_buy"]
-    BUY        = t["buy"]
-    NEUTRAL    = t["neutral"]
-
+    
     result: list[str] = []
-    for score in score_pcts:
-        if score >= STRONG_BUY:
+    for score, chain in zip(score_pcts, chains):
+        ch = str(chain).lower()
+        limits = t["perChain"].get(ch, t["global"])
+        
+        if score >= limits["strong_buy"]:
             result.append("strong_buy")
-        elif score >= BUY:
+        elif score >= limits["buy"]:
             result.append("buy")
-        elif score >= NEUTRAL:
+        elif score >= limits["neutral"]:
             result.append("neutral")
         else:
             result.append("sell")
     return result
 
 
-def _score_to_recommendation(score_pct: float) -> str:
-    """Single-score recommendation using same adaptive thresholds."""
+def _score_to_recommendation(score_pct: float, chain: str) -> str:
+    """Single-score recommendation using per-chain adaptive thresholds."""
     t = _load_thresholds()
-    if score_pct >= t["strong_buy"]:
+    limits = t["perChain"].get(str(chain).lower(), t["global"])
+    
+    if score_pct >= limits["strong_buy"]:
         return "strong_buy"
-    if score_pct >= t["buy"]:
+    if score_pct >= limits["buy"]:
         return "buy"
-    if score_pct >= t["neutral"]:
+    if score_pct >= limits["neutral"]:
         return "neutral"
     return "sell"
 
@@ -461,14 +495,14 @@ def api_latest_picks(top_n: int = 10, chain: str = "all"):
     addresses = [p["token_address"] for p in picks if p.get("token_address")]
     market = _fetch_coinstats_market(addresses)
 
-    # Pre-compute rank-based recommendations across the full batch of picks
     score_pcts_batch = [
         (_safe_float(p.get("score")) or 0.0) * 100.0
         if (_safe_float(p.get("score")) or 0.0) <= 1.0
         else (_safe_float(p.get("score")) or 0.0)
         for p in picks
     ]
-    batch_recommendations = _recommendations_from_scores(score_pcts_batch)
+    chains_batch = [str(p.get("chain", "base")).lower() for p in picks]
+    batch_recommendations = _recommendations_from_scores(score_pcts_batch, chains_batch)
 
     rows: list[dict[str, Any]] = []
     for p, recommendation in zip(picks, batch_recommendations):
@@ -554,25 +588,29 @@ def api_verify_latest():
 
 
 @app.get("/api/performance")
-def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell", verified_only: bool = True):
+def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell", verified_only: bool = True, days: int = 14):
     """
-    Performance endpoint backed by pick_outcomes table (all verified history)
-    plus the live snapshot CSV for picks still too recent to be verified.
+    Performance endpoint backed by pick_outcomes table (verified history).
+    Now defaults to a 14-day window to match adaptive calibration.
     """
     _OUTLIER_CAP = 500.0
-    LONG_LABELS = {"buy", "strong_buy"}
     allowed_labels = {x.strip() for x in labels.split(",") if x.strip()}
     t = _load_thresholds()  # current score thresholds (0-100 scale)
-    _sb, _buy, _neu = t["strong_buy"], t["buy"], t["neutral"]
+    _sb, _buy, _neu = t["global"]["strong_buy"], t["global"]["buy"], t["global"]["neutral"]
+    
+    # SQL for filtering recent history
+    _time_filter = f"picked_at_utc >= NOW() - INTERVAL '{days} days'"
+    
     # SQL expression that normalises model_score to 0-100 regardless of storage scale
     _score_pct_sql = "(CASE WHEN model_score <= 1.0 THEN model_score * 100.0 ELSE model_score END)"
-    # SQL CASE that converts normalised score to label using current thresholds
+    # SQL CASE that converts normalised score to label using current global thresholds (approximate for macro summary)
     _rec_sql = (
         f"CASE WHEN {_score_pct_sql} >= {_sb}  THEN 'strong_buy'"
         f"     WHEN {_score_pct_sql} >= {_buy} THEN 'buy'"
         f"     WHEN {_score_pct_sql} >= {_neu} THEN 'neutral'"
         f"     ELSE 'sell' END"
     )
+
 
     def _is_model_win(rec: str, eff_ret: float) -> bool:
         """Sell = win if price fell; all others = win if price rose."""
@@ -588,7 +626,7 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
             with conn.cursor() as cur:
                 # Most-recent pick per token from pick_outcomes, labelled correctly
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                         po.token_address,
                         COALESCE(t.symbol, po.token_address) AS symbol,
@@ -597,97 +635,46 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                         po.picked_at_utc,
                         po.bucket_timestamp,
                         po.model_score,
-                        po.recommendation,
                         po.entry_price,
                         po.price_2h,
-                        po.effective_return,
-                        po.is_win,
-                        (
-                            SELECT close_price::DOUBLE PRECISION
-                            FROM token_price_5m
-                            WHERE token_address = po.token_address
-                              AND bucket_timestamp >= po.bucket_timestamp + INTERVAL '5 minutes'
-                            ORDER BY bucket_timestamp ASC
-                            LIMIT 1
-                        ) AS price_5m,
-                        (
-                            SELECT close_price::DOUBLE PRECISION
-                            FROM token_price_5m
-                            WHERE token_address = po.token_address
-                              AND bucket_timestamp >= po.bucket_timestamp + INTERVAL '10 minutes'
-                            ORDER BY bucket_timestamp ASC
-                            LIMIT 1
-                        ) AS price_10m
+                        po.effective_return
                     FROM (
-                        SELECT DISTINCT ON (token_address)
-                            token_address, chain, picked_at_utc, bucket_timestamp,
-                            model_score, recommendation, entry_price, price_2h,
-                            effective_return, is_win
-                        FROM pick_outcomes
-                        ORDER BY token_address, picked_at_utc DESC
+                        SELECT * FROM pick_outcomes
+                        WHERE {_time_filter}
+                        ORDER BY picked_at_utc DESC
+                        LIMIT %s
                     ) po
                     LEFT JOIN tokens t ON t.token_address = po.token_address
                     ORDER BY po.picked_at_utc DESC
-                    LIMIT %s
                     """,
                     (limit,),
                 )
+
                 db_rows = cur.fetchall()
 
             for r in db_rows:
-                (
-                    token_address, symbol, name, chain,
-                    picked_at_utc, bucket_ts,
-                    model_score, recommendation,
-                    entry_price, price_2h, eff_ret, is_win_db,
-                    price_5m, price_10m,
-                ) = r
+                token_address, symbol, name, chain, picked_at_utc, bucket_ts, model_score, ep, p2h, eff_ret_raw = r
 
                 score_pct = (float(model_score) * 100.0) if (model_score is not None and float(model_score) <= 1.0) else (float(model_score or 0))
-                # Always re-derive label from current thresholds (stored value may be from old rank-based system)
-                # Use pre-loaded _sb/_buy/_neu to avoid re-reading JSON per row
-                recommendation = ("strong_buy" if score_pct >= _sb else "buy" if score_pct >= _buy else "neutral" if score_pct >= _neu else "sell")
+                # Re-derive label from current thresholds
+                ch_lim = t["perChain"].get(str(chain).lower(), t["global"])
+                recommendation = ("strong_buy" if score_pct >= ch_lim["strong_buy"] else "buy" if score_pct >= ch_lim["buy"] else "neutral" if score_pct >= ch_lim["neutral"] else "sell")
 
                 if allowed_labels and recommendation not in allowed_labels:
                     continue
 
-                ep = float(entry_price) if entry_price is not None else None
-                p2h = float(price_2h) if price_2h is not None else None
-                er2h_raw = float(eff_ret) if eff_ret is not None else None
-                p5 = float(price_5m) if price_5m is not None else None
-                p10 = float(price_10m) if price_10m is not None else None
-                r5_raw = ((p5 - ep) / ep * 100.0) if (p5 and ep) else None
-                r10_raw = ((p10 - ep) / ep * 100.0) if (p10 and ep) else None
-
-                # Cap displayed per-row returns at ±500%; flag real outliers
-                is_outlier = (er2h_raw is not None and abs(er2h_raw) > _OUTLIER_CAP)
-                er2h = _capped(er2h_raw) if er2h_raw is not None else None
-                r5   = _capped(r5_raw)   if r5_raw   is not None else None
-                r10  = _capped(r10_raw)  if r10_raw  is not None else None
-
+                is_outlier = (eff_ret_raw is not None and abs(eff_ret_raw) > _OUTLIER_CAP)
+                er2h = _capped(eff_ret_raw) if eff_ret_raw is not None else None
                 picked_at_str = picked_at_utc.isoformat() if hasattr(picked_at_utc, "isoformat") else str(picked_at_utc)
 
                 verified_rows.append({
-                    "symbol": symbol,
-                    "name": name,
-                    "chain": chain or "base",
-                    "pickedAt": picked_at_str,
-                    "recommendation": recommendation,
-                    "scorePct": score_pct,
-                    "pickedPrice": ep,
-                    "price5m": p5,
-                    "price10m": p10,
-                    "price2h": p2h,
-                    "futurePoints": 24,  # historical; actual bar count not critical
-                    "return5m": r5,
-                    "return10m": r10,
-                    "return2h": er2h,
-                    "effectiveReturn5m": r5,
-                    "effectiveReturn10m": r10,
-                    "effectiveReturn2h": er2h,
-                    "isOutlier": is_outlier,
-                    "verified": True,
+                    "symbol": symbol, "name": name, "chain": chain or "base",
+                    "pickedAt": picked_at_str, "recommendation": recommendation,
+                    "scorePct": score_pct, "pickedPrice": float(ep) if ep else None,
+                    "price2h": float(p2h) if p2h else None, "return2h": er2h,
+                    "effectiveReturn2h": er2h, "isOutlier": is_outlier, "verified": True,
                 })
+
 
     except Exception as exc:
         # DB unavailable — fall through to CSV-only mode
@@ -722,7 +709,8 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                 else (_safe_float(p.get("score")) or 0.0)
                 for p in cycle_picks
             ]
-            _recs = _recommendations_from_scores(_spcts)
+            _schains = [str(p.get("chain", "base")).lower() for p in cycle_picks]
+            _recs = _recommendations_from_scores(_spcts, _schains)
             for p, label in zip(cycle_picks, _recs):
                 _rec_cache[(p["token_address"], cycle_ts)] = label
 
@@ -743,7 +731,8 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
 
             score_raw = _safe_float(r.get("score"))
             score_pct = (score_raw * 100.0) if (score_raw is not None and score_raw <= 1.0) else (score_raw or 0.0)
-            recommendation = _rec_cache.get((token, r.get("picked_at_utc", "")), _score_to_recommendation(score_pct))
+            ch = str(r.get("chain", "base")).lower()
+            recommendation = _rec_cache.get((token, r.get("picked_at_utc", "")), _score_to_recommendation(score_pct, ch))
 
             if allowed_labels and recommendation not in allowed_labels:
                 continue
@@ -826,17 +815,16 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
-                # Overall (re-derive recommendation from model_score using current thresholds)
+                # Overall Summary
                 cur.execute(
                     f"""
                     SELECT
                         COUNT(*),
-                        SUM(CASE WHEN ({_rec_sql} = 'sell' AND effective_return <= 0)
-                                   OR ({_rec_sql} != 'sell' AND effective_return > 0)
-                                 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN effective_return > 0 THEN 1 ELSE 0 END),
                         AVG(LEAST(GREATEST(effective_return, %s), %s))
-                            FILTER (WHERE {_rec_sql} IN ('buy','strong_buy'))
+                            FILTER (WHERE {_rec_sql} IN ('buy','strong_buy','neutral'))
                     FROM pick_outcomes
+                    WHERE {_time_filter}
                     """,
                     (-_OUTLIER_CAP, _OUTLIER_CAP),
                 )
@@ -846,20 +834,19 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                 avg_ret = float(row[2] or 0.0) if row[2] is not None else 0.0
                 win_rate = (wins_all / total * 100.0) if total else 0.0
 
-                # Chain breakdown (re-derive recommendation from model_score using current thresholds)
+                # Chain Breakdown
                 cur.execute(
                     f"""
                     SELECT
                         chain,
                         COUNT(*) AS n,
-                        SUM(CASE WHEN ({_rec_sql} = 'sell' AND effective_return<=0)
-                                   OR ({_rec_sql} != 'sell' AND effective_return>0)
-                                 THEN 1 ELSE 0 END) AS wins,
+                        SUM(CASE WHEN effective_return > 0 THEN 1 ELSE 0 END) AS wins,
                         AVG(LEAST(GREATEST(effective_return, %s), %s))
-                            FILTER (WHERE {_rec_sql} IN ('buy','strong_buy')) AS avg_ret,
-                        MAX(effective_return) FILTER (WHERE {_rec_sql} IN ('buy','strong_buy')) AS best,
-                        MIN(effective_return) FILTER (WHERE {_rec_sql} IN ('buy','strong_buy')) AS worst
+                            FILTER (WHERE {_rec_sql} IN ('buy','strong_buy','neutral')) AS avg_ret,
+                        MAX(effective_return) FILTER (WHERE {_rec_sql} IN ('buy','strong_buy','neutral')) AS best,
+                        MIN(effective_return) FILTER (WHERE {_rec_sql} IN ('buy','strong_buy','neutral')) AS worst
                     FROM pick_outcomes
+                    WHERE {_time_filter}
                     GROUP BY chain ORDER BY n DESC
                     """,
                     (-_OUTLIER_CAP, _OUTLIER_CAP),
@@ -877,19 +864,19 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                         "outliers": 0,
                     }
 
-                # Recommendation breakdown (group by score-derived label, not stored label)
+
+                # Recommendation breakdown
                 cur.execute(
                     f"""
                     SELECT
                         {_rec_sql} AS rec,
                         COUNT(*) AS n,
-                        SUM(CASE WHEN ({_rec_sql} = 'sell' AND effective_return<=0)
-                                   OR ({_rec_sql} != 'sell' AND effective_return>0)
-                                 THEN 1 ELSE 0 END) AS wins,
+                        SUM(CASE WHEN effective_return > 0 THEN 1 ELSE 0 END) AS wins,
                         AVG(LEAST(GREATEST(effective_return, %s), %s)) AS avg_ret,
                         MAX(effective_return) AS best,
                         MIN(effective_return) AS worst
                     FROM pick_outcomes
+                    WHERE {_time_filter}
                     GROUP BY {_rec_sql}
                     """,
                     (-_OUTLIER_CAP, _OUTLIER_CAP),
@@ -907,12 +894,13 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                         "outliers": 0,
                     }
 
-                # Cumulative return (score-derived buy+strong_buy, chronological)
+                # Cumulative return (chronological, last 30d for the chart)
                 cur.execute(
                     f"""
                     SELECT picked_at_utc, LEAST(GREATEST(effective_return, %s), %s)
                     FROM pick_outcomes
-                    WHERE {_rec_sql} IN ('buy','strong_buy')
+                    WHERE {_rec_sql} IN ('buy','strong_buy','neutral')
+                      AND picked_at_utc >= NOW() - INTERVAL '30 days'
                     ORDER BY picked_at_utc ASC
                     """,
                     (-_OUTLIER_CAP, _OUTLIER_CAP),
@@ -920,11 +908,11 @@ def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell
                 equity = 100.0
                 for r in cur.fetchall():
                     ret_pct = float(r[1] or 0.0)
-                    # Guard against invalid <-100% rows from dirty price data.
                     ret_pct = max(ret_pct, -95.0)
                     equity *= (1.0 + ret_pct / 100.0)
                     date_label = r[0].strftime("%b %d") if r[0] else ""
                     cumulative.append({"date": date_label, "cumReturn": equity - 100.0})
+
 
     except Exception:
         import traceback; traceback.print_exc()
@@ -956,37 +944,39 @@ def api_feature_importance():
 
 @app.get("/api/thresholds")
 def api_thresholds():
-    """Return the active score thresholds (calibrated or hardcoded defaults)."""
-    defaults = _DEFAULT_THRESHOLDS   # in 0-100 scale
-    if not THRESHOLDS_PATH.exists():
-        return {
-            "strongBuy":    defaults["strong_buy"],
-            "buy":          defaults["buy"],
-            "neutral":      defaults["neutral"],
-            "calibrated":   False,
-            "sampleSize":   0,
-            "calibratedAt": None,
+    """Return the active score thresholds (calibrated or hardcoded defaults) nested globally and per-chain."""
+    t = _load_thresholds()
+    
+    # Map raw properties for backwards compatibility in case frontend still accesses root-level config
+    res = {
+        "strongBuy":    round(t["global"]["strong_buy"], 1),
+        "buy":          round(t["global"]["buy"], 1),
+        "neutral":      round(t["global"]["neutral"], 1),
+        "calibrated":   t["global"].get("calibrated", False),
+        "sampleSize":   t["global"].get("sampleSize", 0),
+        "calibratedAt": t["global"].get("calibratedAt"),
+        "global": {
+            "strongBuy":    round(t["global"]["strong_buy"], 1),
+            "buy":          round(t["global"]["buy"], 1),
+            "neutral":      round(t["global"]["neutral"], 1),
+            "calibrated":   t["global"].get("calibrated", False),
+            "sampleSize":   t["global"].get("sampleSize", 0),
+            "calibratedAt": t["global"].get("calibratedAt"),
+        },
+        "perChain": {}
+    }
+    
+    for ch, cdata in t["perChain"].items():
+        res["perChain"][ch] = {
+            "strongBuy":    round(cdata["strong_buy"], 1),
+            "buy":          round(cdata["buy"], 1),
+            "neutral":      round(cdata["neutral"], 1),
+            "calibrated":   cdata.get("calibrated", False),
+            "sampleSize":   cdata.get("sampleSize", 0),
+            "calibratedAt": cdata.get("calibratedAt"),
         }
-    try:
-        with open(THRESHOLDS_PATH, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return {
-            "strongBuy":    round(float(d.get("strong_buy", defaults["strong_buy"] / 100)) * 100, 1),
-            "buy":          round(float(d.get("buy",        defaults["buy"]        / 100)) * 100, 1),
-            "neutral":      round(float(d.get("neutral",    defaults["neutral"]    / 100)) * 100, 1),
-            "calibrated":   bool(d.get("calibrated", False)),
-            "sampleSize":   int(d.get("sample_size", 0)),
-            "calibratedAt": d.get("calibrated_at"),
-        }
-    except Exception:
-        return {
-            "strongBuy":    defaults["strong_buy"],
-            "buy":          defaults["buy"],
-            "neutral":      defaults["neutral"],
-            "calibrated":   False,
-            "sampleSize":   0,
-            "calibratedAt": None,
-        }
+        
+    return res
 
 
 def api_settings():
