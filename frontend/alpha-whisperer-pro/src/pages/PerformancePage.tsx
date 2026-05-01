@@ -37,7 +37,7 @@ const IMP_CHAIN_TABS = [
 
 export default function PerformancePage() {
   const [impChain, setImpChain] = useState("all");
-  const { data, isLoading } = useQuery({ queryKey: ["performance"], queryFn: () => backendApi.performance(200), refetchInterval: 15000 });
+  const { data, isLoading } = useQuery({ queryKey: ["performance"], queryFn: () => backendApi.performance(200, 90), refetchInterval: 15000 });
   const { data: impData } = useQuery({ queryKey: ["feature-importance"], queryFn: backendApi.featureImportance, refetchInterval: 30000 });
   const { data: threshData } = useQuery({ queryKey: ["thresholds"], queryFn: backendApi.thresholds, refetchInterval: 30000 });
   const rows = data?.rows ?? [];

@@ -66,7 +66,8 @@ def build_token_metrics_5m(max_swaps: int) -> AggregationStats:
                         token_address,
                         timestamp,
                         side,
-                        COALESCE(amount_token, 0)::NUMERIC(30,10) AS volume_token,
+                        -- ← CHANGED: clamp amount_token before any arithmetic to prevent NUMERIC(30,10) overflow
+                        LEAST(COALESCE(amount_token, 0), 9999999999999999999.0)::NUMERIC(30,10) AS volume_token,
                         buyer_address,
                         seller_address
                     FROM swaps_raw
@@ -87,9 +88,10 @@ def build_token_metrics_5m(max_swaps: int) -> AggregationStats:
                     SELECT
                         token_address,
                         bucket_timestamp,
-                        SUM(volume_token)::NUMERIC(30,10) AS total_volume_token,
-                        SUM(CASE WHEN side = 'buy' THEN volume_token ELSE 0 END)::NUMERIC(30,10) AS buy_volume_token,
-                        SUM(CASE WHEN side = 'sell' THEN volume_token ELSE 0 END)::NUMERIC(30,10) AS sell_volume_token,
+                        -- ← CHANGED: clamp sums too in case multiple large rows add up
+                        LEAST(SUM(volume_token), 9999999999999999999.0)::NUMERIC(30,10) AS total_volume_token,
+                        LEAST(SUM(CASE WHEN side = 'buy' THEN volume_token ELSE 0 END), 9999999999999999999.0)::NUMERIC(30,10) AS buy_volume_token,
+                        LEAST(SUM(CASE WHEN side = 'sell' THEN volume_token ELSE 0 END), 9999999999999999999.0)::NUMERIC(30,10) AS sell_volume_token,
                         COUNT(*)::INTEGER AS trade_count
                     FROM bucketed
                     GROUP BY token_address, bucket_timestamp
@@ -116,11 +118,10 @@ def build_token_metrics_5m(max_swaps: int) -> AggregationStats:
                     SELECT
                         t.token_address,
                         t.bucket_timestamp,
-                        -- USD volume = token_volume * close_price from price table
-                        -- Falls back to 0 when no price available (e.g. Alchemy-only tokens)
-                        (t.total_volume_token * COALESCE(p.close_price, 0))::NUMERIC(30,10) AS total_volume,
-                        (t.buy_volume_token  * COALESCE(p.close_price, 0))::NUMERIC(30,10) AS buy_volume,
-                        (t.sell_volume_token * COALESCE(p.close_price, 0))::NUMERIC(30,10) AS sell_volume,
+                        -- ← CHANGED: clamp final USD volume product to prevent overflow from token_volume * price
+                        LEAST(t.total_volume_token * COALESCE(p.close_price, 0), 9999999999999999999.0)::NUMERIC(30,10) AS total_volume,
+                        LEAST(t.buy_volume_token  * COALESCE(p.close_price, 0), 9999999999999999999.0)::NUMERIC(30,10) AS buy_volume,
+                        LEAST(t.sell_volume_token * COALESCE(p.close_price, 0), 9999999999999999999.0)::NUMERIC(30,10) AS sell_volume,
                         t.trade_count,
                         COALESCE(w.unique_wallets, 0)::INTEGER AS unique_wallets
                     FROM token_agg t

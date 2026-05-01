@@ -66,13 +66,16 @@ def _conn() -> psycopg.Connection:
 _THRESHOLDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "score_thresholds.json")
 
 _DEFAULT_THRESHOLDS: dict = {
-    "strong_buy": 0.35,
-    "buy":        0.27,
+    "strong_buy": 0.38,
+    "buy":        0.28,
     "neutral":    0.20,
     "calibrated": False,
     "sample_size": 0,
     "calibrated_at": None,
 }
+
+# ← ADDED: minimum score gap enforced between bands to prevent collapse
+_MIN_BAND_GAP = 0.05
 
 
 def load_thresholds() -> dict:
@@ -161,10 +164,7 @@ def compute_adaptive_thresholds(conn: psycopg.Connection) -> dict:
     chain_picks = {}
 
     for chain, score, rec, ret in rows:
-        # Define 'win' consistent with the prediction goal: 
-        # Price must go up for long-bias recommendations.
         is_win = (ret > 0)
-        
         pick = (float(score), bool(is_win))
         global_picks.append(pick)
         if chain not in chain_picks:
@@ -183,30 +183,46 @@ def compute_adaptive_thresholds(conn: psycopg.Connection) -> dict:
             cum_wr = cum_wins / cum_n
             cum_rows.append((score, cum_n, cum_wr))
 
-        def _pick_threshold(target: float, min_n: int, default_value: float) -> float:
-            # Scanning from highest score to lowest.
-            # We want the LOWEST score that still satisfies the target win rate
-            # with at least min_n samples.
+        # ← CHANGED: scan independently per band without stopping early,
+        # find best score for each target within its own score window.
+        # strong_buy searches full range, buy searches below sb, neutral below buy.
+        def _pick_threshold_in_window(
+            target: float,
+            min_n: int,
+            default_value: float,
+            score_ceil: float = 1.0,   # ← ADDED: upper bound for this band
+            score_floor_band: float = SCORE_FLOOR,
+        ) -> float:
+            """Find lowest score where cumulative WR >= target, within (score_floor_band, score_ceil]."""
             last_valid = None
             for score, n, wr in cum_rows:
+                if score > score_ceil:
+                    continue  # skip rows above this band's ceiling
+                if score < score_floor_band:
+                    break     # stop scanning below floor
                 if n >= min_n and wr >= target:
                     last_valid = score
-                elif n >= min_n:
-                    # Once WR falls below target, we stop expanding
-                    break
-            
+                # ← CHANGED: do NOT break when WR drops — keep scanning
+                # the full window so buy/neutral can find their own bands
             if last_valid is not None:
-                return max(last_valid, SCORE_FLOOR)
+                return max(last_valid, score_floor_band)
             return default_value
 
-        sb_thresh  = _pick_threshold(TARGET_SB, MIN_SB, fallback["strong_buy"])
-        buy_thresh = _pick_threshold(TARGET_BUY, MIN_BUY, fallback["buy"])
-        neu_thresh = _pick_threshold(TARGET_NEUTRAL, MIN_NEUTRAL, fallback["neutral"])
+        sb_thresh  = _pick_threshold_in_window(TARGET_SB,      MIN_SB,      fallback["strong_buy"], score_ceil=1.0)
+        # ← CHANGED: buy searches below sb_thresh - MIN_BAND_GAP
+        buy_ceil   = sb_thresh - _MIN_BAND_GAP
+        buy_thresh = _pick_threshold_in_window(TARGET_BUY,     MIN_BUY,     fallback["buy"],        score_ceil=buy_ceil)
+        # ← CHANGED: neutral searches below buy_thresh - MIN_BAND_GAP
+        neu_ceil   = buy_thresh - _MIN_BAND_GAP
+        neu_thresh = _pick_threshold_in_window(TARGET_NEUTRAL,  MIN_NEUTRAL, fallback["neutral"],    score_ceil=neu_ceil)
 
-        # Sanity: enforce ordering strong_buy >= buy >= neutral
-        buy_thresh = max(buy_thresh, neu_thresh)
-        sb_thresh  = max(sb_thresh,  buy_thresh)
-        
+        # Sanity: enforce ordering and gap
+        # If calibration still couldn't find separate bands, force defaults with gap
+        if sb_thresh - buy_thresh < _MIN_BAND_GAP:
+            buy_thresh = sb_thresh - _MIN_BAND_GAP
+        if buy_thresh - neu_thresh < _MIN_BAND_GAP:
+            neu_thresh = buy_thresh - _MIN_BAND_GAP
+
         # Ensure within 0-1 and above floor
         sb_thresh  = min(max(sb_thresh,  SCORE_FLOOR), 1.0)
         buy_thresh = min(max(buy_thresh, SCORE_FLOOR), 1.0)
@@ -274,6 +290,20 @@ def _rank_recommendations(scores: list[float], chains: list[str]) -> list[str]:
     return result
 
 
+def _score_to_recommendation(score: float, chain: str = "base") -> str:
+    """Convert a single model score to a recommendation label using chain-specific thresholds.
+    
+    Args:
+        score: Model score (0-1 range expected)
+        chain: Blockchain chain name (used to select per-chain thresholds)
+        
+    Returns:
+        Recommendation label: 'strong_buy', 'buy', 'neutral', or 'sell'
+    """
+    recommendations = _rank_recommendations([score], [chain])
+    return recommendations[0]
+
+
 # ---------------------------------------------------------------------------
 # Ensure table exists
 # ---------------------------------------------------------------------------
@@ -286,6 +316,7 @@ CREATE TABLE IF NOT EXISTS pick_outcomes (
     bucket_timestamp TIMESTAMPTZ   NOT NULL,
     picked_at_utc   TIMESTAMPTZ    NOT NULL,
     model_score     DOUBLE PRECISION NOT NULL,
+    raw_model_score DOUBLE PRECISION,
     recommendation  VARCHAR(20)    NOT NULL,
     entry_price     DOUBLE PRECISION,
     price_2h        DOUBLE PRECISION,
@@ -348,20 +379,9 @@ def verify_and_store(
     wins = 0
     losses = 0
 
-    # -----------------------------------------------------------------------
-    # Pass 1: Validate rows and group by pick cycle (picked_at_utc)
-    # Only rows that are old enough, have a valid entry price, and haven't
-    # been stored yet are kept.  We group them so we can apply rank-based
-    # labeling within each cycle batch.
-    # -----------------------------------------------------------------------
     from collections import defaultdict
-    # cycle_candidates[picked_at_utc] = list of candidate dicts
     cycle_candidates: dict[datetime, list[dict]] = defaultdict(list)
 
-    # ------------------------------------------------------------------
-    # Batch dedup: one query to find ALL already-stored (token, bucket)
-    # pairs from the snapshot, avoiding N+1 queries inside the loop.
-    # ------------------------------------------------------------------
     _pre_tokens: list[str] = []
     _pre_buckets: list[datetime] = []
     for _r in rows:
@@ -403,7 +423,6 @@ def verify_and_store(
             skipped += 1
             continue
 
-        # Only verify picks old enough
         if picked_at > cutoff:
             skipped += 1
             continue
@@ -417,12 +436,10 @@ def verify_and_store(
             skipped += 1
             continue
 
-        # Check if already recorded (batch-preloaded set, no per-row query)
         if (token, bucket_ts) in stored_pairs:
             already += 1
             continue
 
-        # Get entry price
         try:
             entry_price = float(r.get("entry_close_price", "nan"))
         except Exception:
@@ -432,10 +449,15 @@ def verify_and_store(
             skipped += 1
             continue
 
+        # snapshot may now contain both calibrated `score` and `raw_score`
         try:
-            score_raw = float(r.get("score", "0"))
+            score_cal = float(r.get("score", "0"))
         except Exception:
-            score_raw = 0.0
+            score_cal = 0.0
+        try:
+            score_raw = float(r.get("raw_score", r.get("score", "0")))
+        except Exception:
+            score_raw = score_cal
 
         cycle_candidates[picked_at].append({
             "token": token,
@@ -448,9 +470,6 @@ def verify_and_store(
             "row": r,
         })
 
-    # -----------------------------------------------------------------------
-    # Pass 2: Rank within each cycle, look up 2h prices, store outcomes
-    # -----------------------------------------------------------------------
     for picked_at, candidates in cycle_candidates.items():
         scores = [c["score_raw"] for c in candidates]
         chains = [c["chain"] for c in candidates]
@@ -463,7 +482,6 @@ def verify_and_store(
             score_raw = cand["score_raw"]
             chain = cand["chain"]
 
-            # Look up 2h price
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -485,10 +503,6 @@ def verify_and_store(
             price_2h = float(rec[0])
             return_2h = (price_2h - entry_price) / entry_price * 100.0
 
-            # Sanity-check: returns beyond ±500% are almost always caused by
-            # corrupted swap data (e.g. native-currency token mis-pricing,
-            # decimal-place errors).  Skip storing so they never pollute the
-            # accuracy metrics.  Log them so they can be investigated.
             if abs(return_2h) > 500.0:
                 sym = cand["symbol"]
                 print(
@@ -499,24 +513,22 @@ def verify_and_store(
                 skipped += 1
                 continue
 
-            # All picks are long positions — no inversion
             effective_return = return_2h
             is_win = return_2h > 0
 
-            # Store outcome (is_backfill=FALSE → real live pick, used for sample weights)
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO pick_outcomes (
                         token_address, chain, bucket_timestamp, picked_at_utc,
-                        model_score, recommendation, entry_price, price_2h,
+                        model_score, raw_model_score, recommendation, entry_price, price_2h,
                         return_2h, effective_return, is_win, is_backfill, verified_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, NOW())
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, NOW())
                     ON CONFLICT (token_address, bucket_timestamp) DO NOTHING
                     """,
                     (
                         token, chain, bucket_ts, picked_at,
-                        score_raw, recommendation, entry_price, price_2h,
+                        score_cal, score_raw, recommendation, entry_price, price_2h,
                         return_2h, effective_return, is_win,
                     ),
                 )
@@ -564,31 +576,9 @@ def load_feedback_weights(
     win_boost: float = 1.2,
     loss_boost: float = 1.5,
 ) -> np.ndarray:
-    """Compute per-sample training weights using feedback outcomes.
-
-    For tokens the model previously picked:
-      - Losses get `loss_boost`× weight (learn harder from mistakes)
-      - Wins get `win_boost`× weight (reinforce good patterns)
-      - Unpicked tokens get `base_weight` (1.0)
-
-    This ensures the model pays extra attention to tokens it has actually
-    encountered in live trading, especially to patterns that led to losses.
-
-    Args:
-        conn: DB connection
-        token_addresses: List of token addresses in training data
-        bucket_timestamps: List of bucket_timestamps in training data
-        base_weight: Default weight for samples without feedback
-        win_boost: Weight multiplier for previously-won picks
-        loss_boost: Weight multiplier for previously-lost picks
-
-    Returns:
-        numpy array of sample weights, same length as token_addresses
-    """
+    """Compute per-sample training weights using feedback outcomes."""
     weights = np.full(len(token_addresses), base_weight, dtype=np.float64)
 
-    # Load all outcomes into a lookup set — EXCLUDE backfilled rows (retroactive scoring
-    # by today's model; those picks don't reflect real decisions and must not bias weights)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT token_address, bucket_timestamp, is_win, return_2h, recommendation FROM pick_outcomes WHERE is_backfill = FALSE"
@@ -599,22 +589,17 @@ def load_feedback_weights(
         print("[FEEDBACK] No feedback outcomes yet — using uniform weights")
         return weights
 
-    # Build lookup: (token_address, bucket_timestamp_iso) → (model_error, return_2h)
-    # model_error = True when the model's directional call was WRONG:
-    #   - Predicted bullish (buy/strong_buy) but price fell  → model error
-    #   - Predicted bearish (sell) but price rose            → model error (false negative)
-    # Neutral picks are unpredictional → skip weight boosting
     outcome_map: dict[tuple[str, str], tuple[bool, float]] = {}
     for token, bucket_ts, is_win, ret, rec in outcomes:
         key = (token, bucket_ts.isoformat() if hasattr(bucket_ts, "isoformat") else str(bucket_ts))
         bullish_pick = rec in ("buy", "strong_buy")
         bearish_pick = rec == "sell"
         if bullish_pick:
-            model_error = not bool(is_win)          # predicted up, got down
+            model_error = not bool(is_win)
         elif bearish_pick:
-            model_error = bool(is_win)              # predicted no-rise, but price rose
+            model_error = bool(is_win)
         else:
-            model_error = None                      # neutral — no directional claim
+            model_error = None
         outcome_map[key] = (model_error, float(ret) if ret is not None else 0.0)
 
     boosted = 0
@@ -624,25 +609,19 @@ def load_feedback_weights(
         if key in outcome_map:
             model_error, ret = outcome_map[key]
             if model_error is None:
-                # Neutral prediction — no directional claim, leave at base weight
                 pass
             elif model_error:
-                # Model was directionally wrong — learn harder from this
-                magnitude = min(abs(ret) / 8.0, 4.0)  # cap at 4x additional
+                magnitude = min(abs(ret) / 8.0, 4.0)
                 weights[i] = loss_boost + magnitude
                 boosted += 1
             else:
-                # Model was directionally correct — mild reinforcement
                 weights[i] = win_boost
                 boosted += 1
 
-    # Also boost ANY occurrence of tokens that had outcomes (even at different buckets)
-    # to help the model learn the general patterns of picked tokens
     outcome_tokens = {token for token, *_ in outcomes}
     token_boosted = 0
     for i, addr in enumerate(token_addresses):
         if addr in outcome_tokens and weights[i] == base_weight:
-            # Mild boost for same token at different time
             weights[i] = base_weight * 1.2
             token_boosted += 1
 
@@ -662,7 +641,6 @@ def load_feedback_weights(
 def print_stats(conn: psycopg.Connection) -> None:
     """Print detailed feedback statistics for the last 14 days."""
     with conn.cursor() as cur:
-        # Time filter for consistency
         SINCE_14D = "picked_at_utc >= NOW() - INTERVAL '14 days'"
 
         cur.execute(f"SELECT COUNT(*), SUM(CASE WHEN is_win THEN 1 ELSE 0 END) FROM pick_outcomes WHERE {SINCE_14D}")
@@ -740,8 +718,6 @@ def print_stats(conn: psycopg.Connection) -> None:
     print(f"{'='*75}")
 
 
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -766,7 +742,6 @@ def main() -> None:
         if args.verify:
             print(f"[FEEDBACK] Verifying picks from {args.snapshot_path}...")
             verify_and_store(conn, args.snapshot_path, args.min_age_minutes)
-            # Auto-recalibrate thresholds after every verify run
             print(f"\n[FEEDBACK] Recalibrating thresholds...")
             compute_adaptive_thresholds(conn)
 

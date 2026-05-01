@@ -1,22 +1,23 @@
 Token ends: ...Fc2AQ71y
-Total Scanned: 35
-Total Viable:  35
-Memes Searched: 30
-Matches: 23
-MATCH #1: WTF! A whale literally burned $1.2 Million worth of Bitcoin ...
-  source=reddit, virality=56.8
-  coins: ['WTF', 'WORTH', 'MM']
-MATCH #2: #雪山救狐 staying low-key while delivering big vibes in my priva...
-  source=x, virality=51.3
-  coins: ['KEY', 'KEY']
-MATCH #3: $Noorung    is  Norug.
+Total Scanned: 20
+Total Viable:  20
+Memes Searched: 20
+Matches: 10
+MATCH #1: Good morning and Happy Monday to everyone who believes it is...
+  source=x, virality=66.0
+  coins: ['HAPPY', 'MONDAY']
+MATCH #2: I found a literal Jewhouse
 
-5Vt84ukEKHuxYA7wjH3PDwCzTGumPS7MDNGX...
-  source=x, virality=48.2
-  coins: ['MEMECOIN', 'MEMECOIN', 'MEMECOIN', 'MEMECOIN', 'NOORUNG']
-MATCH #4: How Monero Replaced Bitcoin on the Internet's Underground...
-  source=reddit, virality=45.1
-  coins: ['BTC', 'XMR', 'XMR']
-MATCH #5: Brave, the browser of BAT (Basic Attention Token),  just reg...
-  source=reddit, virality=44.4
-  coins: ['BAT', 'ATTN']
+This crib in NY is going giga vi...
+  source=x, virality=52.7
+  coins: ['MM']
+MATCH #3: I found the next animal runner that we can all support! 
+$RI...
+  source=x, virality=47.7
+  coins: ['RICO', 'VIRAL']
+MATCH #4: This is the best "Anti-AI" narrative right now People are st...
+  source=x, virality=43.2
+  coins: ['ANTI']
+MATCH #5: 🌈 NATURE’S GREATEST SHOW: The Viral Double Rainbow Stunning ...
+  source=x, virality=26.8
+  coins: ['VIRAL', 'RNBW']

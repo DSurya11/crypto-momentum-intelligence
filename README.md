@@ -136,7 +136,7 @@ http://127.0.0.1:8001
 Open:
 
 ```
-http://localhost:5173
+http://localhost:8080
 ```
 
 ---
@@ -307,36 +307,47 @@ Thresholds for `strong_buy`, `buy`, and `neutral` are continuously self-calibrat
 | Settings     | `/settings`    | Configuration panel  |
 
 ---
+
 \
+
 ## Screenshots
 
-*(Note: Save your screenshots to an `assets/` folder in the root directory to display them here)*
+_(Note: Save your screenshots to an `assets/` folder in the root directory to display them here)_
 
 ### Dashboard Overview
+
 ![Dashboard](assets/dashboard.png)
 
 ### Live Momentum Picks
+
 ![Live Picks](assets/live_picks.png)
 
 ### Meme Radar
+
 ![Meme Radar](assets/meme_radar.png)
 
 ### Performance Overview
+
 ![Performance](assets/performance.png)
 
 ### Pending Predictions
+
 ![Pending Predictions](assets/performance_pending.png)
 
 ### Verified Prediction Outcomes
+
 ![Prediction Outcomes](assets/performance_outcomes.png)
 
 ### Win Rate & Cumulative Return
+
 ![Cumulative Return](assets/cumulative_return.png)
 
 ### Model Auto-Calibration & Thresholds (BSC)
+
 ![BSC Thresholds](assets/bsc_thresholds.png)
 
 ### Feature Importance Tracking
+
 ![Feature Importance](assets/feature_importance.png)
 
 ## Performance metrics explained
@@ -521,7 +532,8 @@ psycopg v3
 not `psycopg2`. Always run scripts using the `.venv` Python interpreter.
 
 ---
-## Future Scope - Deployment 
+
+## Future Scope - Deployment
 
 This system retrains an ML model every **5 minutes**, which requires a small VPS.
 

@@ -588,10 +588,10 @@ def api_verify_latest():
 
 
 @app.get("/api/performance")
-def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell", verified_only: bool = True, days: int = 14):
+def api_performance(limit: int = 100, labels: str = "strong_buy,buy,neutral,sell", verified_only: bool = True, days: int = 90):
     """
     Performance endpoint backed by pick_outcomes table (verified history).
-    Now defaults to a 14-day window to match adaptive calibration.
+    Defaults to a wider 90-day window so older verified outcomes still show up on the dashboard.
     """
     _OUTLIER_CAP = 500.0
     allowed_labels = {x.strip() for x in labels.split(",") if x.strip()}
@@ -992,6 +992,7 @@ def api_thresholds():
     return res
 
 
+@app.get("/api/settings")
 def api_settings():
     def mask(v: str | None) -> str:
         if not v:

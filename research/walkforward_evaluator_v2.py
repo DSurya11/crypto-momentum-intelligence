@@ -220,6 +220,7 @@ def make_logistic():
         ("scaler",StandardScaler()),
         ("clf",LogisticRegression(class_weight="balanced",max_iter=1000))
     ])
+
 def make_random_forest(y_train):
 
     pos=int(np.sum(y_train))
@@ -243,6 +244,7 @@ def make_random_forest(y_train):
         class_weight={0:1,1:spw},
         random_state=42
     )
+
 def make_extratrees(y_train):
 
     pos=int(np.sum(y_train))
@@ -266,6 +268,7 @@ def make_extratrees(y_train):
         class_weight={0:1,1:spw},
         random_state=42
     )
+
 def make_xgboost(y_train,**overrides):
 
     pos=int(np.sum(y_train))
@@ -334,6 +337,15 @@ def tune_xgboost(x,y,top_frac=0.1):
         best={}
 
     return best
+
+
+# ← REMOVED: apply_smote_if_needed() deleted entirely.
+# Imbalance is handled natively by scale_pos_weight in XGBoost
+# and class_weight in RandomForest / ExtraTrees.
+# SMOTE was causing score clustering (most tokens outputting 0.44)
+# because synthetic samples dominated the small per-chain datasets.
+
+
 def stacking_oof_predictions(
     x,
     y,
@@ -413,30 +425,27 @@ def main():
         if len(idx) < 100:
             print(f"Skipping {chain} - too few samples ({len(idx)})")
             continue
-            
+
         print(f"\n--- Training {chain.upper()} Model ({len(idx)} rows) ---")
         x_c = dataset.features[idx]
         y_c = dataset.labels[idx]
-        
-        # Simple XGBoost for importance/metrics reporting in this script
-        # Note: live_top_coins.py handles the full Stacking logic.
+
         model = make_xgboost(y_c)
         model.fit(x_c, y_c)
-        
+
         prob = model.predict_proba(x_c)[:, 1]
         auc = roc_auc_score(y_c, prob)
         print(f"{chain.upper()} Training ROC-AUC: {auc:.4f}")
-        
+
         imp = model.feature_importances_
         feat_imp = {n: float(imp[i]) for i, n in enumerate(dataset.feature_names)}
-        
+
         per_chain_results[chain] = {
             "auc": float(auc),
             "trainRows": int(len(idx)),
             "features": feat_imp
         }
-        
-        # Accumulate for global average
+
         for n, v in feat_imp.items():
             global_feat_imp[n] = global_feat_imp.get(n, 0.0) + v / len(all_chains)
 

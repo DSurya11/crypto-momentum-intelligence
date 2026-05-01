@@ -227,6 +227,7 @@ def insert_pick(
     recommendation: str,
     entry_price: float,
     price_2h: float | None,
+    raw_model_score: float | None = None,
 ) -> bool:
     """Insert a pick outcome. Returns True if inserted, False if skipped."""
     if price_2h is None or np.isnan(entry_price) or entry_price == 0:
@@ -235,19 +236,22 @@ def insert_pick(
     return_2h = (price_2h - entry_price) / entry_price * 100.0
     is_win = return_2h > 0
 
+    if raw_model_score is None:
+        raw_model_score = model_score
+
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO pick_outcomes (
                 token_address, chain, bucket_timestamp, picked_at_utc,
-                model_score, recommendation, entry_price, price_2h,
+                model_score, raw_model_score, recommendation, entry_price, price_2h,
                 return_2h, effective_return, is_win, is_backfill, verified_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW())
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW())
             ON CONFLICT (token_address, bucket_timestamp) DO NOTHING
             """,
             (
                 token_address, chain, bucket_ts, picked_at_utc,
-                model_score, recommendation, entry_price, price_2h,
+                model_score, raw_model_score, recommendation, entry_price, price_2h,
                 return_2h, return_2h, is_win,
             ),
         )
