@@ -120,6 +120,21 @@ def load_pool_addresses_from_db(chain: str) -> list[str]:
     return [row[0] for row in rows]
 
 
+# ← ADDED: max value safe for NUMERIC(30,10) — anything larger gets clamped
+_MAX_NUMERIC = 9.999999999e19
+
+
+def _safe_numeric(value: Any) -> float | None:
+    """Clamp a numeric value to fit within NUMERIC(30,10). Prevents overflow on extreme BSC token amounts."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+        return min(f, _MAX_NUMERIC)
+    except (TypeError, ValueError):
+        return None
+
+
 def insert_swaps(swaps: list[NormalizedSwap], chain: str) -> tuple[int, int]:
     if not swaps:
         return 0, 0
@@ -170,8 +185,8 @@ def insert_swaps(swaps: list[NormalizedSwap], chain: str) -> tuple[int, int]:
                         swap.timestamp,
                         swap.buyer_address,
                         swap.seller_address,
-                        swap.amount_token,
-                        swap.amount_usd,
+                        _safe_numeric(swap.amount_token),  # ← CHANGED: clamp overflow
+                        _safe_numeric(swap.amount_usd),    # ← CHANGED: clamp overflow
                         swap.side,
                         swap.tx_hash,
                     ),

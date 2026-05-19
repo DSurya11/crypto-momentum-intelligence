@@ -84,13 +84,13 @@ export const backendApi = {
       `/api/latest-picks?top_n=${topN}&chain=${encodeURIComponent(chains.length ? chains.join(",") : "all")}`
     ),
   verifyLatest: () => apiGet<{ pickedAt: string; now: string; elapsedMinutes: number; rows: Array<{ rank: number; symbol: string; name: string; tokenAddress: string; entryPrice: number | null; nowPrice: number | null; changePct: number | null }> }>("/api/verify-latest"),
-  performance: (limit = 200) => apiGet<{
+  performance: (limit = 200, days = 90) => apiGet<{
     rows: PerformanceRecord[];
     cumulative: Array<{ date: string; cumReturn: number }>;
     summary: { winRate: number; avgReturn2h: number; total: number };
     chainBreakdown?: Record<string, { total: number; wins: number; winRate: number; avgReturn: number; bestReturn: number; worstReturn: number }>;
     recBreakdown?: Record<string, { total: number; wins: number; winRate: number; avgReturn: number; bestReturn: number; worstReturn: number }>;
-  }>(`/api/performance?limit=${limit}&labels=strong_buy,buy,neutral,sell&verified_only=false`),
+  }>(`/api/performance?limit=${limit}&labels=strong_buy,buy,neutral,sell&verified_only=false&days=${days}`),
   settings: () => apiGet<{ env: Array<{ key: string; value: string; masked: boolean }> }>("/api/settings"),
   featureImportance: () => apiGet<{ features: Record<string, number>; timestamp: string | null; model: string | null; featureSet: string | null; trainRows: number; scoringRows: number }>("/api/feature-importance"),
   thresholds: () => apiGet<{ 

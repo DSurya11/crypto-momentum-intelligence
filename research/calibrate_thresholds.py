@@ -7,12 +7,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_conn():
+    password = os.getenv("PGPASSWORD")
+    if not password:
+        raise ValueError("PGPASSWORD environment variable is required but not set")
+    
     return psycopg.connect(
         host=os.getenv("PGHOST", "localhost"),
         port=int(os.getenv("PGPORT", "5432")),
         dbname=os.getenv("PGDATABASE", "crypto_momentum"),
         user=os.getenv("PGUSER", "postgres"),
-        password=os.getenv("PGPASSWORD", "password"),
+        password=password,
         sslmode=os.getenv("PGSSLMODE", "disable"),
     )
 

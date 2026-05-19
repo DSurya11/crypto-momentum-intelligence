@@ -31,8 +31,8 @@ from walkforward_evaluator_v2 import (
     robust_preprocess,
     stacking_oof_predictions,
     tune_xgboost,
+    
 )
-from sklearn.isotonic import IsotonicRegression
 
 
 def get_env(name: str, default: str | None = None) -> str:
@@ -68,8 +68,13 @@ def latest_bucket(conn: psycopg.Connection) -> datetime:
         raise ValueError("No features_5m rows found")
     return row[0]
 
-def build_isotonic_calibrator(conn: psycopg.Connection) -> IsotonicRegression | None:
-    print("[CALIBRATION] Fetching 14-day history for Isotonic Regression...")
+def build_isotonic_calibrator(conn: psycopg.Connection):
+    """Build a smooth calibration via Platt scaling instead of isotonic regression.
+    
+    Isotonic regression creates step functions that quantize scores (many duplicates).
+    Platt scaling (logistic calibration) preserves score granularity smoothly.
+    """
+    print("[CALIBRATION] Fetching 14-day history for Platt scaling...")
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -88,12 +93,24 @@ def build_isotonic_calibrator(conn: psycopg.Connection) -> IsotonicRegression | 
         scores = np.array([float(r[0]) for r in rows])
         labels = np.array([int(r[1]) for r in rows])
         
-        calibrator = IsotonicRegression(out_of_bounds='clip')
-        calibrator.fit(scores, labels)
-        print(f"[CALIBRATION] Fitted IsotonicRegression on {len(rows)} outcomes")
-        return calibrator
+        # Use Platt scaling (logistic regression in 1D) instead of isotonic regression
+        # This preserves score granularity and avoids quantization from step functions
+        from sklearn.linear_model import LogisticRegression as PlattScaling
+        platt = PlattScaling()
+        platt.fit(scores.reshape(-1, 1), labels)
+        print(f"[CALIBRATION] Fitted Platt scaling on {len(rows)} outcomes")
+        
+        # Wrap platt to mimic IsotonicRegression's transform() interface
+        class PlattCalibrator:
+            def __init__(self, model):
+                self.model = model
+            def transform(self, scores_array):
+                """Apply Platt scaling transformation."""
+                return self.model.predict_proba(scores_array.reshape(-1, 1))[:, 1]
+        
+        return PlattCalibrator(platt)
     except Exception as e:
-        print(f"[CALIBRATION] Warning: Isotonic calibration failed: {e}")
+        print(f"[CALIBRATION] Warning: Calibration failed: {e}")
         return None
 
 def load_training_data(conn: psycopg.Connection, feature_set: str, label_target: str, before_bucket: datetime):
@@ -411,12 +428,17 @@ def save_snapshot(path: str, rows: list[dict]) -> None:
         "name",
         "token_address",
         "chain",
+        "raw_score",
         "score",
         "entry_close_price",
     ]
 
     def _normalize_row(row: dict) -> dict:
         out = dict(row)
+        # Skip accidental duplicated header rows that can appear in malformed CSVs
+        if str(out.get("token_address", "")).strip() == "token_address":
+            return {}
+
         chain_val = out.get("chain")
         chain = str(chain_val).strip().lower() if chain_val is not None else ""
         if not chain:
@@ -429,11 +451,25 @@ def save_snapshot(path: str, rows: list[dict]) -> None:
                 if shifted_chain:
                     out["chain"] = shifted_chain
                     out["score"] = entry_val
+                    out["raw_score"] = out.get("raw_score", out.get("score"))
                     extras = out.get(None)
                     if isinstance(extras, list) and extras:
                         out["entry_close_price"] = extras[0]
         if not out.get("chain"):
             out["chain"] = "base"
+
+        # If a row was written with new fields against an old header, values shift right:
+        # score -> raw_score, entry_close_price -> score, extras[0] -> entry_close_price.
+        extras = out.get(None)
+        if isinstance(extras, list) and extras:
+            shifted_raw = out.get("score")
+            shifted_score = out.get("entry_close_price")
+            out["raw_score"] = shifted_raw
+            out["score"] = shifted_score
+            out["entry_close_price"] = extras[0]
+
+        if out.get("raw_score") is None:
+            out["raw_score"] = out.get("score")
         return out
 
     exists = os.path.exists(path)
@@ -446,15 +482,21 @@ def save_snapshot(path: str, rows: list[dict]) -> None:
 
     if file_has_content:
         with open(path, "r", newline="", encoding="utf-8") as f:
-            existing_rows = list(csv.DictReader(f))
-        needs_migration = bool(existing_rows) and "chain" not in existing_rows[0]
+            reader = csv.DictReader(f)
+            existing_rows = list(reader)
+            existing_fields = [h for h in (reader.fieldnames or []) if h is not None]
+
+        # Migrate when schema drift is detected (e.g., missing new `raw_score` column)
+        required = set(fields)
+        needs_migration = not required.issubset(set(existing_fields))
         if needs_migration:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fields)
                 w.writeheader()
                 for row in existing_rows:
                     normalized = _normalize_row(row)
-                    w.writerow({k: normalized.get(k) for k in fields})
+                    if normalized:
+                        w.writerow({k: normalized.get(k) for k in fields})
             # Re-read after migration
             with open(path, "r", newline="", encoding="utf-8") as f:
                 existing_rows = list(csv.DictReader(f))
@@ -800,11 +842,14 @@ def main() -> None:
                 sample_weights=sw,
                 model_save_path=args.model_path,
             )
-
+            # Keep both raw (uncalibrated) and calibrated probabilities
+            p_raw = p
             if calibrator is not None:
-                p = calibrator.transform(p)
+                p_cal = calibrator.transform(p_raw)
+            else:
+                p_cal = p_raw
 
-            chain_models[ch] = p
+            chain_models[ch] = {"raw": p_raw, "cal": p_cal}
             tuned = tuned_params
             importances_per_chain[ch] = imp
             importances = imp  # fallback: last chain for combined view
@@ -822,11 +867,12 @@ def main() -> None:
             if ch not in chain_models:
                 ch = next(iter(chain_models))
 
-            # Apply a heavy penalty if under threshold to prevent it from out-ranking true BUY signals
-            p_val = chain_models[ch][i]
-            if p_val < chain_thresholds.get(ch, 0.55):
-                p_val = p_val * 0.5
-            probs[i] = p_val
+            # Apply a heavy penalty to calibrated score if under threshold
+            p_raw_i = chain_models[ch]["raw"][i]
+            p_cal_i = chain_models[ch]["cal"][i]
+            if p_cal_i < chain_thresholds.get(ch, 0.55):
+                p_cal_i = p_cal_i * 0.5
+            probs[i] = p_cal_i
 
         ranked_idx = np.argsort(probs)[::-1]
         now_utc = datetime.now(timezone.utc).isoformat()
@@ -970,6 +1016,7 @@ def main() -> None:
             "name": m_name,
             "token_address": m["token_address"],
             "chain": m.get("chain", "base"),
+            "raw_score": float(chain_models[ch]["raw"][idx]),
             "score": score,
             "entry_close_price": display_price,
         }

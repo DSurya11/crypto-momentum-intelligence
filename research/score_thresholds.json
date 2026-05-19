@@ -1,44 +1,44 @@
 {
   "global": {
-    "strong_buy": 0.35,
-    "buy": 0.27,
-    "neutral": 0.2,
+    "strong_buy": 0.38,
+    "buy": 0.28,
+    "neutral": 0.1934,
     "calibrated": true,
-    "sample_size": 2544,
-    "calibrated_at": "2026-03-26T16:59:15.855948+00:00"
+    "sample_size": 3666,
+    "calibrated_at": "2026-03-29T17:07:00.773582+00:00"
   },
   "perChain": {
-    "eth": {
-      "strong_buy": 0.35,
-      "buy": 0.27,
-      "neutral": 0.25,
+    "base": {
+      "strong_buy": 0.38,
+      "buy": 0.28,
+      "neutral": 0.2,
       "calibrated": true,
-      "sample_size": 530,
-      "calibrated_at": "2026-03-26T16:59:15.857454+00:00"
+      "sample_size": 955,
+      "calibrated_at": "2026-03-29T17:07:00.774581+00:00"
+    },
+    "eth": {
+      "strong_buy": 0.4261,
+      "buy": 0.2965,
+      "neutral": 0.1504,
+      "calibrated": true,
+      "sample_size": 818,
+      "calibrated_at": "2026-03-29T17:07:00.774581+00:00"
     },
     "solana": {
-      "strong_buy": 0.4139,
-      "buy": 0.27,
-      "neutral": 0.15,
+      "strong_buy": 0.4275,
+      "buy": 0.28,
+      "neutral": 0.1514,
       "calibrated": true,
-      "sample_size": 711,
-      "calibrated_at": "2026-03-26T16:59:15.858467+00:00"
+      "sample_size": 1000,
+      "calibrated_at": "2026-03-29T17:07:00.775570+00:00"
     },
     "bsc": {
-      "strong_buy": 0.35,
-      "buy": 0.27,
+      "strong_buy": 0.38,
+      "buy": 0.28,
       "neutral": 0.2,
       "calibrated": true,
-      "sample_size": 687,
-      "calibrated_at": "2026-03-26T16:59:15.858467+00:00"
-    },
-    "base": {
-      "strong_buy": 0.35,
-      "buy": 0.27,
-      "neutral": 0.2,
-      "calibrated": true,
-      "sample_size": 616,
-      "calibrated_at": "2026-03-26T16:59:15.859978+00:00"
+      "sample_size": 893,
+      "calibrated_at": "2026-03-29T17:07:00.776585+00:00"
     }
   }
 }

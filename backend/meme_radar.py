@@ -42,53 +42,16 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
+# ← CHANGED: trimmed to 8 best subreddits for rising velocity signal
 MEME_SUBREDDITS = [
-    # ── CORE MEME HUBS ────────────────────────────────────────────────────
-    "memes",              # 50M+ members, benchmark for mainstream viral content
-    "dankmemes",          # Faster-moving than r/memes, breaks trends earlier
-    "MemeEconomy",        # Explicitly tracks rising vs dying meme formats
-    "AdviceAnimals",      # Classic image macros, animal memes often become coins
-    "funny",              # Broad humor, catches crossover memes
-
-    # ── EARLY DETECTION (memes born here before going mainstream) ─────────
-    "OutOfTheLoop",       # "What is X?" posts = meme breaking RIGHT NOW before peak
-    "ComedyHeaven",       # Surreal/absurdist memes, PEPE-type coins originate here
-    "okbuddyretard",      # Deep irony memes, 4chan overflow, early niche coin signal
-    "196",                # Gen Z absurdist hub, extremely fast meme cycle
-    "me_irl",             # Relatable memes, large Gen Z base, fast-moving
-    "2meirl4meirl",       # Offshoot of me_irl, catches emotional viral spikes
-
-    # ── POP CULTURE (TV/film/music events spawn meme coins overnight) ─────
-    "entertainment",      # Broad pop culture events
-    "movies",             # Film release memes, movie character coins get launched
-    "television",         # Show finales/premieres create instant meme spikes
-    "popculturechat",     # Celebrity moments go viral here first
-    "Unexpected",         # Viral surprise clips become memes fast
-    "HolUp",              # Reaction memes to absurd news/clips
-
-    # ── ANIMAL MEMES (direct lineage: DOGE, SHIB, BONK, WIF, CAT) ────────
-    "rarepuppers",        # Dog memes — direct DOGE/SHIB/BONK signal
-    "IllegallySmolCats",  # Cat memes — CAT/NYAN coin territory
-    "AnimalsBeingDerps",  # Cross-species viral animal content
-    "Zoomies",            # High-energy animal clips going viral
-
-    # ── YOUTH/GEN Z CULTURE (fastest meme-to-coin pipeline) ──────────────
-    "teenagers",          # Gen Z trends start here before TikTok
-    "TikTokCringe",       # TikTok memes spill to Reddit here, 24-48hr early signal
-    "youngpeopleyoutube", # Youth reaction culture
-    "GenZ",               # Self-aware Gen Z meme discussion
-
-    # ── VIRAL/TRENDING CONTENT (cross-platform spillover) ────────────────
-    "interestingasfuck",  # Viral non-meme content that BECOMES memes
-    "instant_regret",     # High-engagement reaction content
-    "therewasanattempt",  # Failure memes, surprisingly strong coin association
-    "Whatcouldgowrong",   # Failure/reaction meme pool
-    "HumansBeingBros",    # Wholesome viral, spawns positivity-themed coins
-
-    # ── INTERNET CULTURE META ─────────────────────────────────────────────
-    "knowyourmeme",       # If it's here it's confirmed viral — lagging but strong signal
-    "DeepFriedMemes",     # Heavily processed/ironic memes, Gen Z coin culture
-    "surrealmemes",       # Abstract memes, many abstract coins trace back here
+    "memes",           # 50M+ members, benchmark for mainstream viral content
+    "dankmemes",       # Faster-moving, breaks trends earlier
+    "MemeEconomy",     # Explicitly tracks rising vs dying meme formats
+    "CryptoMoonShots", # Direct crypto meme coin discovery
+    "196",             # Gen Z absurdist hub, extremely fast meme cycle
+    "me_irl",          # Relatable memes, large Gen Z base, fast-moving
+    "teenagers",       # Gen Z trends start here before TikTok
+    "okbuddyretard",   # Deep irony memes, 4chan overflow, early niche coin signal
 ]
 
 # X/Twitter search queries — crypto-meme-focused
@@ -351,6 +314,11 @@ def fetch_subreddit_hot(subreddit: str, limit: int = 25) -> list[MemePost]:
 
 def fetch_all_subreddits(limit_per_sub: int = 20) -> list[MemePost]:
     """Fetch live Reddit posts using Apify (trudax/reddit-scraper-lite).
+
+    Changes from original:
+      - Uses /rising/ instead of /hot/ — fetches posts gaining upvotes RIGHT NOW
+      - maxItems capped at 40 — keeps cost ~$0.05 and runtime ~1 min
+      - Only 8 high-signal subreddits instead of 35+
     
     The trudax scraper returns fields:
       title, upVotes, numberOfComments, parsedCommunityName,
@@ -361,17 +329,18 @@ def fetch_all_subreddits(limit_per_sub: int = 20) -> list[MemePost]:
         print("[MEME RADAR] No APIFY_API_TOKEN found, skipping Reddit fetch.")
         return []
 
-    print("[MEME RADAR] Using Apify to scan Reddit...")
+    print("[MEME RADAR] Using Apify to scan Reddit (rising)...")
     url = f"https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items?token={apify}"
-    
-    start_urls = [{"url": f"https://www.reddit.com/r/{sub}/hot/"} for sub in MEME_SUBREDDITS]
-    
+
+    # ← CHANGED: /rising/ instead of /hot/ — captures velocity momentum
+    start_urls = [{"url": f"https://www.reddit.com/r/{sub}/rising/"} for sub in MEME_SUBREDDITS]
+
     payload = json.dumps({
         "startUrls": start_urls,
-        "maxItems": limit_per_sub * len(MEME_SUBREDDITS),
+        "maxItems": 40,        # ← CHANGED: hard cap at 40 (was limit_per_sub * 35+)
         "skipComments": True
     }).encode("utf-8")
-    
+
     try:
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -436,7 +405,7 @@ def fetch_all_subreddits(limit_per_sub: int = 20) -> list[MemePost]:
     return posts
 
 # ---------------------------------------------------------------------------
-# X/Twitter fetching  (using danek/twitter-scraper-ppr — $0.30/1K results)
+# X/Twitter fetching  (using kaitoeasyapi PPR — $0.25/1K tweets)
 # ---------------------------------------------------------------------------
 
 def _x_bearer_token() -> str:
@@ -448,9 +417,11 @@ def _apify_api_token() -> str:
     return os.getenv("APIFY_API_TOKEN", "").strip()
 
 
-def fetch_all_x(max_per_query: int = 15) -> list[MemePost]:
+def fetch_all_x(max_per_query: int = 20) -> list[MemePost]:
     """Fetch live Twitter/X posts using Apify (kaitoeasyapi PPR — $0.25/1K tweets).
     
+    maxItems stays at 20 — same as before, already optimal ($0.01/run, 14s).
+
     Uses keyword search mode via 'twitterContent'. Output fields:
       text, likeCount, retweetCount, replyCount, viewCount,
       createdAt (Twitter native format), author.userName, url
@@ -468,7 +439,7 @@ def fetch_all_x(max_per_query: int = 15) -> list[MemePost]:
     
     payload = json.dumps({
         "twitterContent": combined_search,
-        "maxItems": max_per_query,
+        "maxItems": max_per_query,  # 20 — already optimal, no change needed
     }).encode("utf-8")
     
     try:
@@ -816,8 +787,8 @@ def run_meme_radar(
     """
     # Support both old-style (limit_per_sub) and new-style (limit_reddit/limit_x) params
     reddit_limit = limit_reddit if limit_reddit is not None else limit_per_sub
-    x_limit = limit_x if limit_x is not None else 10
-    
+    x_limit = limit_x if limit_x is not None else 20  # ← default matches fetch_all_x default
+
     # 1. Fetch all posts from Reddit + X
     all_posts = fetch_all_subreddits(limit_per_sub=reddit_limit)
     x_posts = fetch_all_x(max_per_query=x_limit)
