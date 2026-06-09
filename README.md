@@ -312,7 +312,7 @@ Thresholds for `strong_buy`, `buy`, and `neutral` are continuously self-calibrat
 
 ## Screenshots
 
-_(Note: Save your screenshots to an `assets/` folder in the root directory to display them here)_
+
 
 ### Dashboard Overview
 
